@@ -417,6 +417,8 @@
     "audioPassthroughDescription": "Send Dolby/DTS audio to your receiver or TV without re-encoding, preserving surround sound. Turn off if you have no sound.",
     "audioPassthroughDescriptionApple": "Use Apple's native Dolby decoder for Dolby Digital Plus, including Atmos. DTS and TrueHD still play as multichannel PCM. Turn off if you have no sound.",
     "audioPassthroughOverriddenByNormalization": "Off while loudness normalization is on",
+    "passthroughKeepAlive": "Keep Bitstream Alive While Paused",
+    "passthroughKeepAliveDescription": "Experimental. Keeps feeding your receiver silence while paused so it does not drop and re-lock the Dolby/DTS stream. Audio may run on for up to a second after pausing. Takes effect on the next video.",
     "audioChannelLimit": "Audio Channels",
     "audioChannelLimitDescription": "Mix decoded audio down for speakers, headphones, or HDMI setups that cannot play every channel",
     "audioChannelLimitOriginal": "Original",

@@ -1198,6 +1198,12 @@ class Translations$settings$en {
 	/// en: 'Off while loudness normalization is on'
 	String get audioPassthroughOverriddenByNormalization => 'Off while loudness normalization is on';
 
+	/// en: 'Keep Bitstream Alive While Paused'
+	String get passthroughKeepAlive => 'Keep Bitstream Alive While Paused';
+
+	/// en: 'Experimental. Keeps feeding your receiver silence while paused so it does not drop and re-lock the Dolby/DTS stream. Audio may run on for up to a second after pausing. Takes effect on the next video.'
+	String get passthroughKeepAliveDescription => 'Experimental. Keeps feeding your receiver silence while paused so it does not drop and re-lock the Dolby/DTS stream. Audio may run on for up to a second after pausing. Takes effect on the next video.';
+
 	/// en: 'Audio Channels'
 	String get audioChannelLimit => 'Audio Channels';
 
@@ -8184,6 +8190,8 @@ extension on Translations {
 			'settings.audioPassthroughDescription' => 'Send Dolby/DTS audio to your receiver or TV without re-encoding, preserving surround sound. Turn off if you have no sound.',
 			'settings.audioPassthroughDescriptionApple' => 'Use Apple\'s native Dolby decoder for Dolby Digital Plus, including Atmos. DTS and TrueHD still play as multichannel PCM. Turn off if you have no sound.',
 			'settings.audioPassthroughOverriddenByNormalization' => 'Off while loudness normalization is on',
+			'settings.passthroughKeepAlive' => 'Keep Bitstream Alive While Paused',
+			'settings.passthroughKeepAliveDescription' => 'Experimental. Keeps feeding your receiver silence while paused so it does not drop and re-lock the Dolby/DTS stream. Audio may run on for up to a second after pausing. Takes effect on the next video.',
 			'settings.audioChannelLimit' => 'Audio Channels',
 			'settings.audioChannelLimitDescription' => 'Mix decoded audio down for speakers, headphones, or HDMI setups that cannot play every channel',
 			'settings.audioChannelLimitOriginal' => 'Original',
@@ -8299,10 +8307,10 @@ extension on Translations {
 			'themeEditor.slots.outline' => 'Outline',
 			'themeEditor.slots.text' => 'Text',
 			'themeEditor.slots.textMuted' => 'Secondary text',
-			'themeEditor.slots.accent' => 'Accent',
-			'themeEditor.opacity' => 'Opacity',
 			_ => null,
 		} ?? switch (path) {
+			'themeEditor.slots.accent' => 'Accent',
+			'themeEditor.opacity' => 'Opacity',
 			'themeEditor.hexHint' => '#RRGGBB or #AARRGGBB',
 			'themeEditor.fromOtherThemes' => 'From other themes',
 			'themeEditor.swatchLabel' => ({required Object theme, required Object color}) => '${theme} ${color}',
@@ -8813,10 +8821,10 @@ extension on Translations {
 			'profiles.tokenIdentityMismatch' => 'The Plex profile token resolved to an unexpected server',
 			'connections.sectionTitle' => 'Connections',
 			'connections.addConnection' => 'Add connection',
-			'connections.addConnectionSubtitleNoProfile' => 'Sign in with Plex or connect a Jellyfin or Emby server',
-			'connections.addConnectionSubtitleScoped' => ({required Object displayName}) => 'Add to ${displayName}: Plex, Jellyfin, Emby, or another profile connection',
 			_ => null,
 		} ?? switch (path) {
+			'connections.addConnectionSubtitleNoProfile' => 'Sign in with Plex or connect a Jellyfin or Emby server',
+			'connections.addConnectionSubtitleScoped' => ({required Object displayName}) => 'Add to ${displayName}: Plex, Jellyfin, Emby, or another profile connection',
 			'connections.sessionExpiredOne' => ({required Object name}) => 'Session expired for ${name}',
 			'connections.sessionExpiredMany' => ({required Object count}) => 'Session expired for ${count} servers',
 			'connections.accessDeniedOne' => ({required Object name}) => '${name} refused access for this account',
@@ -9327,10 +9335,10 @@ extension on Translations {
 			'liveTv.recordSettings.keepUpToHint' => '0 keeps every episode',
 			'liveTv.startingInMinutes' => ({required Object minutes}) => 'Starting in ${minutes} min',
 			'liveTv.dayAtTime' => ({required Object day, required Object time}) => '${day} at ${time}',
-			'liveTv.invalidPlaybackData' => ({required Object product}) => '${product} returned invalid Live TV playback data',
-			'liveTv.failedToStartChannel' => 'Could not start the live channel',
 			_ => null,
 		} ?? switch (path) {
+			'liveTv.invalidPlaybackData' => ({required Object product}) => '${product} returned invalid Live TV playback data',
+			'liveTv.failedToStartChannel' => 'Could not start the live channel',
 			'liveTv.failedToBuildStreamUrl' => 'Could not build the stream URL',
 			'liveTv.playbackStartFailed' => ({required Object reason}) => 'Couldn\'t start the channel: ${reason}',
 			'liveTv.channelSwitchFailed' => ({required Object reason}) => 'Couldn\'t switch channel: ${reason}',
@@ -9841,10 +9849,10 @@ extension on Translations {
 			'metadataEdit.onNextRefresh' => 'On next refresh',
 			'metadataEdit.seasons' => 'Seasons',
 			'metadataEdit.show' => 'Show',
-			'metadataEdit.hide' => 'Hide',
-			'metadataEdit.episodeOrdering' => 'Episode Ordering',
 			_ => null,
 		} ?? switch (path) {
+			'metadataEdit.hide' => 'Hide',
+			'metadataEdit.episodeOrdering' => 'Episode Ordering',
 			'metadataEdit.tmdbAiring' => 'The Movie Database (Aired)',
 			'metadataEdit.tvdbAiring' => 'TheTVDB (Aired)',
 			'metadataEdit.tvdbAbsolute' => 'TheTVDB (Absolute)',

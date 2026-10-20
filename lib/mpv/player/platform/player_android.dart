@@ -17,6 +17,7 @@ class PlayerAndroid extends PlayerBase {
   String _dvConversionMode = 'auto';
   bool _audioNormalizationEnabled = false;
   bool _audioPassthroughEnabled = false;
+  bool _passthroughKeepAliveEnabled = false;
   bool _downmixEnabled = false;
   int _downmixCenterBoostDb = 0;
   bool _downmixNormalize = true;
@@ -117,6 +118,7 @@ class PlayerAndroid extends PlayerBase {
         'tunnelingEnabled': _tunnelingEnabled,
         'dvConversionMode': _dvConversionMode,
         'audioPassthroughEnabled': _audioPassthroughEnabled,
+        'passthroughKeepAliveEnabled': _passthroughKeepAliveEnabled,
         // Cheap (32-bit) TV boxes run the hardware video path a frame behind a GL
         // subtitle overlay; render the ASS one frame earlier there to realign.
         'assVideoLatencyFrames': DevicePerformance.isLowEndHardware ? 1 : 0,
@@ -322,6 +324,15 @@ class PlayerAndroid extends PlayerBase {
         break;
       case 'tunneled-playback':
         _tunnelingEnabled = value != 'no';
+        break;
+      // Not an mpv property: ExoPlayer's pause-time silence for bitstream tracks.
+      case 'passthrough-keepalive':
+        final enabled = value != 'no';
+        _passthroughKeepAliveEnabled = enabled;
+        await _applyWhenInitialized(
+          () => invoke('setPassthroughKeepAlive', {'enabled': enabled}),
+          () => _passthroughKeepAliveEnabled == enabled,
+        );
         break;
       case 'content-frame-rate':
         final fps = double.tryParse(value);

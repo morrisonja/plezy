@@ -48,6 +48,14 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
   val audioDelayUs = AtomicLong(0L)
 
   /**
+   * Whether a bitstream track should stay alive across a pause by playing silence instead of
+   * pausing (see [KeepAliveAudioOutput]). Read when each AudioTrack is created.
+   */
+  var passthroughKeepAliveEnabled: (() -> Boolean)? = null
+
+  private val silenceAssets = SilenceAssets(context)
+
+  /**
    * Stereo-downmix processor; inactive while every registered matrix is identity.
    * Pre-populated for counts 1..12 so sink configure can never hit
    * "No mixing matrix for input channel count". ExoPlayerCore swaps in
@@ -178,9 +186,15 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
       .setPassthroughBufferDurationUs(500_000)
       .build()
 
-    val realProvider = AudioTrackAudioOutputProvider.Builder(context)
-      .setAudioTrackBufferSizeProvider(bufferSizeProvider)
-      .build()
+    val realProvider = KeepAliveOutputProvider(
+      AudioTrackAudioOutputProvider.Builder(context)
+        .setAudioTrackBufferSizeProvider(bufferSizeProvider)
+        .build(),
+      enabled = { passthroughKeepAliveEnabled?.invoke() == true },
+      isCarrier = false,
+      assets = silenceAssets::load,
+      log = audioDiagnosticsLogger
+    )
 
     // Shared position: RawPositionAudioOutput writes the raw AudioTrack position,
     // PositionFixAudioSink reads it to bypass DefaultAudioSink's writtenDuration clamp.
@@ -234,7 +248,7 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
     context: Context,
     bufferSizeProvider: DefaultAudioTrackBufferSizeProvider
   ): AudioSink {
-    val provider = AudioTrackAudioOutputProvider.Builder(context)
+    val trackProvider = AudioTrackAudioOutputProvider.Builder(context)
       .setAudioTrackBufferSizeProvider(bufferSizeProvider)
       .apply {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -260,6 +274,14 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
         }
       }
       .build()
+    // The carrier is PCM-shaped, so its keepalive silence is zero frames: IEC 61937 stuffing.
+    val provider = KeepAliveOutputProvider(
+      trackProvider,
+      enabled = { passthroughKeepAliveEnabled?.invoke() == true },
+      isCarrier = true,
+      assets = silenceAssets::load,
+      log = audioDiagnosticsLogger
+    )
 
     return DefaultAudioSink.Builder(context)
       .setEnableFloatOutput(false)

@@ -269,6 +269,7 @@ class ExoPlayerPlugin :
       "setDvConversionMode" -> handleSetDvConversionMode(call, result)
       "setAudioNormalization" -> handleSetAudioNormalization(call, result)
       "setAudioPassthrough" -> handleSetAudioPassthrough(call, result)
+      "setPassthroughKeepAlive" -> handleSetPassthroughKeepAlive(call, result)
       "setAudioDownmix" -> handleSetAudioDownmix(call, result)
       "observeProperty" -> handleObserveProperty(call, result)
       "setMpvProperty" -> handleSetMpvProperty(call, result)
@@ -305,6 +306,7 @@ class ExoPlayerPlugin :
     val tunnelingEnabled = call.argument<Boolean>("tunnelingEnabled") ?: false
     dvConversionMode = call.argument<String>("dvConversionMode") ?: "auto"
     val audioPassthroughEnabled = call.argument<Boolean>("audioPassthroughEnabled") ?: false
+    val passthroughKeepAliveEnabled = call.argument<Boolean>("passthroughKeepAliveEnabled") ?: false
     val assVideoLatencyFrames = call.argument<Int>("assVideoLatencyFrames") ?: 0
     val subtitleRenderScale = call.argument<Double>("subtitleRenderScale")?.toFloat() ?: 1.0f
     // ExoPlayer-only: mpv's read-ahead is owned by the mpv.conf editor, so there is no
@@ -352,6 +354,7 @@ class ExoPlayerPlugin :
         val success = core.initialize(
           tunnelingEnabled = tunnelingEnabled,
           audioPassthroughEnabled = audioPassthroughEnabled,
+          passthroughKeepAliveEnabled = passthroughKeepAliveEnabled,
           bufferTier = bufferTier
         )
         if (!success) {
@@ -1216,6 +1219,23 @@ class ExoPlayerPlugin :
     }
     currentActivity?.runOnUiThread {
       playerCore?.setAudioPassthrough(enabled)
+      result.success(true)
+    } ?: result.error("NO_ACTIVITY", "Activity not available", null)
+  }
+
+  private fun handleSetPassthroughKeepAlive(call: MethodCall, result: MethodChannel.Result) {
+    val enabled = call.argument<Boolean>("enabled")
+    if (enabled == null) {
+      result.error("INVALID_ARGS", "Missing 'enabled'", null)
+      return
+    }
+    // ExoPlayer-only: the mpv fallback's audiotrack output has no silence path.
+    if (usingMpvFallback) {
+      result.success(true)
+      return
+    }
+    activity?.runOnUiThread {
+      playerCore?.setPassthroughKeepAlive(enabled)
       result.success(true)
     } ?: result.error("NO_ACTIVITY", "Activity not available", null)
   }
