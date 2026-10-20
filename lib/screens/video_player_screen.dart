@@ -1831,6 +1831,8 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
       if (Platform.isAndroid && useExoPlayer) {
         final tunneledPlayback = settingsService.read(SettingsService.tunneledPlayback);
         await currentPlayer.setProperty('tunneled-playback', tunneledPlayback ? 'yes' : 'no');
+        final passthroughKeepAlive = settingsService.read(SettingsService.passthroughKeepAlive);
+        await currentPlayer.setProperty('passthrough-keepalive', passthroughKeepAlive ? 'yes' : 'no');
         await currentPlayer.setProperty('exo-buffer-tier', playbackBufferTier.nativeValue);
       }
       if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {

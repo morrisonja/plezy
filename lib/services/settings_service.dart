@@ -739,6 +739,11 @@ class SettingsService extends BaseSharedPreferencesService {
   static const matchContentFrameRate = BoolPref('match_content_frame_rate');
   static const matchContentResolution = BoolPref('match_content_resolution');
   static const tunneledPlayback = BoolPref('tunneled_playback', defaultValue: false);
+
+  /// ExoPlayer backend only: keep a Dolby/DTS bitstream track playing silence
+  /// across a pause instead of pausing it, so the receiver does not drop and
+  /// re-lock the stream. Experimental; applies to the next audio track.
+  static const passthroughKeepAlive = BoolPref('android_passthrough_keepalive', defaultValue: false);
   static const dvConversionMode = EnumPref<DvConversionModePreference>(
     'dv_conversion_mode',
     values: DvConversionModePreference.values,
@@ -1504,6 +1509,7 @@ class SettingsService extends BaseSharedPreferencesService {
     matchContentFrameRate,
     matchContentResolution,
     tunneledPlayback,
+    passthroughKeepAlive,
     dvConversionMode,
     disableDolbyVision,
     hdrSdrConversion,

@@ -103,6 +103,7 @@ class PlaybackSettingsScreen extends StatelessWidget {
               title: t.settings.audio,
               children: [
                 if (PlatformDetector.supportsAudioPassthrough()) _audioPassthroughTile(),
+                if (exoActive && PlatformDetector.supportsAudioPassthrough()) _passthroughKeepAliveTile(),
                 _audioChannelLimitTile(exoActive: exoActive),
                 // Only a stereo fold mixes the center away; any fold can clip.
                 if (channelLimit == AudioChannelLimit.stereo) _downmixCenterBoostTile(),
@@ -541,6 +542,21 @@ class PlaybackSettingsScreen extends StatelessWidget {
             ? t.settings.audioPassthroughDescriptionApple
             : t.settings.audioPassthroughDescription,
         enabled: !normalizationOn,
+      );
+    },
+  );
+
+  // ExoPlayer-only prototype: the mpv backend's audio output has no silence path yet.
+  Widget _passthroughKeepAliveTile() => SettingsBuilder(
+    prefs: const [SettingsService.audioPassthrough],
+    builder: (context) {
+      final passthroughOn = SettingsService.instance.read(SettingsService.audioPassthrough);
+      return SettingSwitchTile(
+        pref: SettingsService.passthroughKeepAlive,
+        icon: Symbols.pause_circle_rounded,
+        title: t.settings.passthroughKeepAlive,
+        subtitle: t.settings.passthroughKeepAliveDescription,
+        enabled: passthroughOn,
       );
     },
   );

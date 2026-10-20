@@ -251,6 +251,11 @@ class ExoPlayerCore(private val activity: Activity) :
   // PCM mixer streams, so while enabled we block direct/bitstream output and
   // disable tunneling.
   private var audioPassthroughEnabled: Boolean = false
+
+  // Keep a bitstream track playing silence across a pause instead of pausing it, so the
+  // receiver does not drop and re-lock the stream (see KeepAliveAudioOutput). Applies to
+  // AudioTracks created after it changes.
+  private var passthroughKeepAliveEnabled: Boolean = false
   private var audioNormalizationEnabled: Boolean = false
 
   // Stereo downmix: runs as a ChannelMixingAudioProcessor inside the sink's
@@ -577,6 +582,7 @@ class ExoPlayerCore(private val activity: Activity) :
   fun initialize(
     tunnelingEnabled: Boolean = true,
     audioPassthroughEnabled: Boolean = false,
+    passthroughKeepAliveEnabled: Boolean = false,
     // Read-ahead depth, as the wire name Dart sends. Kept a String because `LoadControlPolicy`
     // is internal and this function is not; unrecognised names resolve to Auto, which is also
     // the default (#1816).
@@ -589,6 +595,7 @@ class ExoPlayerCore(private val activity: Activity) :
 
     tunnelingUserEnabled = tunnelingEnabled
     this.audioPassthroughEnabled = audioPassthroughEnabled
+    this.passthroughKeepAliveEnabled = passthroughKeepAliveEnabled
     this.dvMode = getConfiguredDvMode()
     displayHdrSupported = DoviBridge.displaySupportsHdr(activity)
     DoviBridge.logSupportSummary(activity)
@@ -696,6 +703,8 @@ class ExoPlayerCore(private val activity: Activity) :
         audioDiagnosticsLogger = { level, prefix, message -> emitLog(level, prefix, message) }
         videoDiagnosticsLogger = { level, prefix, message -> emitLog(level, prefix, message) }
         shouldBlockDirectAudioOutput = { format -> this@ExoPlayerCore.shouldBlockDirectAudioOutput(format, "sink support") }
+        // `this.` because initialize()'s parameter of the same name shadows the factory's property.
+        this.passthroughKeepAliveEnabled = { this@ExoPlayerCore.passthroughKeepAliveEnabled }
         onAudioCapabilitiesChanged = { updateAudioDecoderPolicy("audio capabilities changed") }
         setEnableDecoderFallback(true)
         setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
@@ -3585,6 +3594,12 @@ class ExoPlayerCore(private val activity: Activity) :
     } else {
       updateTunnelingState("audio-normalization")
     }
+  }
+
+  fun setPassthroughKeepAlive(enabled: Boolean) {
+    if (passthroughKeepAliveEnabled == enabled) return
+    passthroughKeepAliveEnabled = enabled
+    emitLog("info", "keepalive", "Passthrough keepalive ${if (enabled) "enabled" else "disabled"}; applies to the next audio track")
   }
 
   fun setAudioPassthrough(enabled: Boolean) {
