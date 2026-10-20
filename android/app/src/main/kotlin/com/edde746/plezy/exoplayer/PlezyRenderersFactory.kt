@@ -55,6 +55,9 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
 
   private val silenceAssets = SilenceAssets(context)
 
+  /** One parked keepalive track per player, shared by both sinks' providers. */
+  private val keepAliveParkingLot = KeepAliveParkingLot()
+
   /**
    * Stereo-downmix processor; inactive while every registered matrix is identity.
    * Pre-populated for counts 1..12 so sink configure can never hit
@@ -193,7 +196,8 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
       enabled = { passthroughKeepAliveEnabled?.invoke() == true },
       isCarrier = false,
       assets = silenceAssets::load,
-      log = audioDiagnosticsLogger
+      log = audioDiagnosticsLogger,
+      lot = keepAliveParkingLot
     )
 
     // Shared position: RawPositionAudioOutput writes the raw AudioTrack position,
@@ -280,7 +284,8 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
       enabled = { passthroughKeepAliveEnabled?.invoke() == true },
       isCarrier = true,
       assets = silenceAssets::load,
-      log = audioDiagnosticsLogger
+      log = audioDiagnosticsLogger,
+      lot = keepAliveParkingLot
     )
 
     return DefaultAudioSink.Builder(context)

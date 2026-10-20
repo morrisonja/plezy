@@ -39,6 +39,18 @@ import java.util.concurrent.atomic.AtomicLong
  * tail (up to one passthrough buffer) is heard after the pause press, and the clock resumes
  * after it. This is a known prototype artifact.
  *
+ * Seeks: media3 pauses the sink, releases the output, and asks for a new one only once the new
+ * position has buffered, seconds later. A wrapper that is playing when it is flushed or released
+ * bridges that gap instead: it pauses, flushes and restarts the delegate within milliseconds
+ * (discarding the old position's tail and any hold silence), feeds silence at once, and on a
+ * release parks itself in [KeepAliveOutputProvider] to be handed back for the next track of the
+ * same config. The first real write ends the bridge. Because media3 writes that first audio
+ * before it restarts the renderers, a bridge whose sink is still paused turns straight into a
+ * hold after that write, so the new position is neither heard early nor allowed to catch the
+ * clock up with the frames written (which would wedge the player in BUFFERING). The accounting
+ * restarts at the bridge's flush, as media3's does: before the first real write the position
+ * is zero, and bridge silence is subtracted like hold silence afterwards.
+ *
  * Known limitation: object formats (Atmos JOC, TrueHD Atmos, DTS:X) have no silence encoder.
  * Their carrier gets zero stuffing and their raw E-AC3 track gets plain E-AC3 silence, which
  * the receiver may treat as a format change.
@@ -133,9 +145,66 @@ internal class SilenceAssets(context: Context) {
 }
 
 /**
+ * The one track a player keeps alive across a seek. Both sinks' providers (the normal one and
+ * the IEC 61937 carrier's) share a lot, so a track parked by one can never hold the HDMI route
+ * hostage while the other builds its own: any request that does not get the parked track back
+ * releases it for real first.
+ */
+internal class KeepAliveParkingLot {
+  private var parked: KeepAliveAudioOutput? = null
+  private var parkedConfig: AudioOutputProvider.OutputConfig? = null
+  private var owner: Any? = null
+
+  fun park(owner: Any, output: KeepAliveAudioOutput, config: AudioOutputProvider.OutputConfig) {
+    val previous = parked
+    if (previous != null && previous !== output) previous.releaseForReal("displaced by a newer track")
+    parked = output
+    parkedConfig = config
+    this.owner = owner
+  }
+
+  /**
+   * Hands the parked track back when [owner] asks for the config it was parked with (and
+   * [reusable] allows it); otherwise releases it for real and returns null. Either way the lot is
+   * empty afterwards.
+   */
+  fun take(owner: Any, config: AudioOutputProvider.OutputConfig, reusable: Boolean): KeepAliveAudioOutput? {
+    val held = parked ?: return null
+    val match = reusable && this.owner === owner && parkedConfig == config && held.reacquire()
+    clear()
+    if (!match) {
+      // The replacement is built while this track is still going away, as media3 itself does on
+      // every flush; the alternatives are worse (see RawPositionOutputProvider).
+      held.releaseForReal("not reusable for the next track")
+      return null
+    }
+    return held
+  }
+
+  fun evict(owner: Any, reason: String) {
+    if (this.owner !== owner) return
+    parked?.releaseForReal(reason)
+    clear()
+  }
+
+  private fun clear() {
+    parked = null
+    parkedConfig = null
+    owner = null
+  }
+}
+
+/**
  * Wraps every output a provider hands out in [KeepAliveAudioOutput] when the feature is on and
  * the track has a silence source. [enabled] is read per track, so a toggle lands on the next
  * AudioTrack rather than mid-stream.
+ *
+ * The provider is also where a seek is bridged. media3 releases the output on every flush, and
+ * only asks for a new one once the new position has buffered, seconds later; a released
+ * AudioTrack would take the bitstream down for all of that. A wrapper that is playing when it is
+ * released parks itself in the [lot] instead and keeps feeding silence. The next request for an
+ * identical config gets the parked wrapper back, still playing, and its first real write ends the
+ * bridge. Any other request, a toggle of the feature or [release] evicts the parked track for real.
  */
 @OptIn(UnstableApi::class)
 internal class KeepAliveOutputProvider(
@@ -143,10 +212,17 @@ internal class KeepAliveOutputProvider(
   private val enabled: () -> Boolean,
   private val isCarrier: Boolean,
   private val assets: (String) -> ByteArray?,
-  private val log: ((String, String, String) -> Unit)?
+  private val log: ((String, String, String) -> Unit)?,
+  /** Tests drive the wrappers' feeding themselves. */
+  private val spawnFeederThread: Boolean = true,
+  /** Shared between the providers of one player; see [KeepAliveParkingLot]. */
+  private val lot: KeepAliveParkingLot = KeepAliveParkingLot()
 ) : AudioOutputProvider by delegate {
 
+  private var released = false
+
   override fun getAudioOutput(config: AudioOutputProvider.OutputConfig): AudioOutput {
+    lot.take(this, config, reusable = enabled())?.let { return it }
     val real = delegate.getAudioOutput(config)
     if (!enabled()) return real
     val silence = KeepAliveSilence.forConfig(config, isCarrier, assets, log) ?: return real
@@ -156,7 +232,27 @@ internal class KeepAliveOutputProvider(
       "Armed: ${silence.label} on encoding=${config.encoding} rate=${config.sampleRate} " +
         "channels=${Integer.bitCount(config.channelMask)} buffer=${config.bufferSize}"
     )
-    return KeepAliveAudioOutput(real, silence, config.sampleRate, log)
+    return KeepAliveAudioOutput(
+      real,
+      silence,
+      config.sampleRate,
+      log,
+      spawnFeederThread = spawnFeederThread,
+      park = { output ->
+        if (released) {
+          false
+        } else {
+          lot.park(this, output, config)
+          true
+        }
+      }
+    )
+  }
+
+  override fun release() {
+    released = true
+    lot.evict(this, "provider released")
+    delegate.release()
   }
 }
 
@@ -169,7 +265,14 @@ internal class KeepAliveAudioOutput(
   /** How much audio (real tail plus silence) to keep queued ahead of the playback head. */
   targetAheadUs: Long = 200_000L,
   /** Tests drive [feedOnce] themselves instead of spawning the feeder thread. */
-  private val spawnFeederThread: Boolean = true
+  private val spawnFeederThread: Boolean = true,
+  /**
+   * Takes this output when media3 releases it mid-seek so it can keep bridging; returns false
+   * when nobody can hold it, in which case the release goes through for real.
+   */
+  private val park: ((KeepAliveAudioOutput) -> Boolean)? = null,
+  /** A bridge nobody comes back for is cut after this long and the track paused for real. */
+  private val bridgeTimeoutMs: Long = BRIDGE_TIMEOUT_MS
 ) : AudioOutput {
 
   private val lock = Any()
@@ -178,11 +281,30 @@ internal class KeepAliveAudioOutput(
   /** True between a keepalive pause and the join of its feeder; the renderer's writes are refused. */
   @Volatile private var holding = false
 
-  /** Set by play/flush/stop/release to end the feeder; the feeder finishes a partial unit first. */
+  /** True from a flush or release of a playing track until the first real write after the seek. */
+  @Volatile private var bridging = false
+
+  /** Set to end the feeder; the feeder finishes a partial unit first. */
   @Volatile private var stopRequested = false
 
-  /** The feeder could not write and the delegate was paused for real instead. */
-  @Volatile private var delegatePaused = false
+  /** The delegate's AudioTrack is playing: play() reached it and nothing paused it for real since. */
+  @Volatile private var delegatePlaying = false
+
+  /** The delegate was told to stop (end of stream); it is draining and cannot be kept alive. */
+  private var delegateStopped = false
+
+  /** media3's own view of the track: play() was called more recently than pause(). */
+  private var sinkPlaying = false
+
+  /** A stop() swallowed while silence was being fed; forwarded once the feeding ends on a resume. */
+  private var stopDeferred = false
+
+  /** A bridge is waiting for its first real frames, which decide whether a hold must follow. */
+  private var awaitingFirstRealWrite = false
+
+  /** A silence write failed; the track is suspect and is not handed back after a seek. */
+  @Volatile private var broken = false
+  private var releasedForReal = false
 
   private var feeder: Thread? = null
 
@@ -197,13 +319,18 @@ internal class KeepAliveAudioOutput(
   /** Feeder-only: a unit the delegate accepted partially; it must complete before anything else. */
   private var pendingUnit: ByteBuffer? = null
   private var unitsWritten = 0L
-  private var holdStartedMs = 0L
+  private var feedStartedMs = 0L
+
+  /** Listeners registered through this wrapper, so a park can answer them and detach them. */
+  private val listeners = ArrayList<AudioOutput.Listener>()
 
   val isHolding: Boolean get() = holding
+  val isBridging: Boolean get() = bridging
   val silenceFrames: Long get() = silenceFramesWritten.get()
 
   override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
     if (holding) return false
+    if (bridging) stopFeeder("first real write")
     if (!silence.isPcm && framesPerAccessUnit == 0 && buffer.hasRemaining()) {
       framesPerAccessUnit = silence.framesPerAccessUnit(buffer)
     }
@@ -213,6 +340,18 @@ internal class KeepAliveAudioOutput(
       realFramesWritten += (before - buffer.remaining()) / silence.pcmFrameSize
     } else if (handled) {
       realFramesWritten += framesPerAccessUnit.toLong() * encodedAccessUnitCount
+    }
+    if (awaitingFirstRealWrite && realFramesWritten > 0) {
+      awaitingFirstRealWrite = false
+      // media3 fills the track before it restarts the renderers after a seek, so the first real
+      // frames normally land while the sink is still paused. The track must not play on into
+      // them: the new position would be heard early and, once the clock caught up with the frames
+      // written, the renderer would turn not-ready and the player wedge in BUFFERING. Hold, as a
+      // pause does, until play() arrives; the one unit just written is what keeps the renderer
+      // ready (frames written > position) in the meantime.
+      synchronized(lock) {
+        if (!sinkPlaying && delegatePlaying && !holding) engageHold("the sink is still paused after the seek")
+      }
     }
     return handled
   }
@@ -227,13 +366,17 @@ internal class KeepAliveAudioOutput(
       return raw
     }
     var adjusted = raw - framesToUs(silenceFrames)
+    // A bridge writes silence into a freshly flushed track before any real audio: nothing real
+    // has played, so the clock is at zero, not below it.
+    if (adjusted < 0L) adjusted = 0L
     // While paused media3 counts the audio renderer as ready only while the sink still has
     // pending data, i.e. the position is behind the frames written. A hold must therefore
     // report a frozen clock, as a real pause does: if the head's estimate ever overshot and the
     // reported position reached the written frames, the renderer would turn not-ready, the
     // player would sit in BUFFERING, and its resume could never arrive to end the hold.
     if (holding && positionAtPauseUs != Long.MIN_VALUE && adjusted > positionAtPauseUs) adjusted = positionAtPauseUs
-    // And at no time can more real audio have played than was written.
+    // And at no time can more real audio have played than was written. Before the first real
+    // write after a seek this pins the clock at zero whatever the head reports.
     val writtenUs = framesToUs(realFramesWritten)
     if (adjusted > writtenUs) adjusted = writtenUs
     // Silence is written ahead of being played, so the subtraction can dip below the last
@@ -245,82 +388,225 @@ internal class KeepAliveAudioOutput(
 
   override fun pause() {
     synchronized(lock) {
-      if (holding) return
-      if (delegatePaused) {
+      sinkPlaying = false
+      // Silence is already flowing; a bridge turns into a hold by itself at its first real write.
+      if (holding || bridging) return
+      if (!delegatePlaying) {
         delegate.pause()
         return
       }
-      positionAtPauseUs = getPositionUs()
-      holding = true
-      stopRequested = false
-      holdStartedMs = System.currentTimeMillis()
-      unitsWritten = 0
-      val queued = queuedFrames()
-      log?.invoke(
-        "info",
-        "keepalive",
-        "Engaged: ${silence.label}; ~${framesToUs(queued) / 1000}ms of real audio queued, " +
-          "silence starts once that drains to ${targetAheadFrames * 1000 / sampleRate}ms"
-      )
-      if (spawnFeederThread) {
-        feeder = Thread({ runFeeder() }, "plezy-keepalive").apply {
-          priority = Thread.MAX_PRIORITY
-          start()
-        }
-      }
+      engageHold(null)
     }
   }
 
   override fun play() {
-    val wasHolding = stopFeeder("resume")
-    if (wasHolding && !delegatePaused) return // the track never paused
-    delegatePaused = false
-    delegate.play()
+    synchronized(lock) { sinkPlaying = true }
+    val endedHold = holding && stopFeeder("resume")
+    synchronized(lock) {
+      if (endedHold && stopDeferred) {
+        // The stream ended while paused: let the track drain and stop as media3 asked.
+        forwardStop()
+        return
+      }
+      // A bridge keeps feeding: its first real write ends it, and the track is already playing.
+      if (delegatePlaying) return
+      if (delegateStopped) {
+        delegate.play()
+        return
+      }
+      delegatePlaying = true
+      delegate.play()
+    }
   }
 
   override fun flush() {
+    if (canBridge()) {
+      bridge("flush")
+      return
+    }
     stopFeeder("flush")
+    synchronized(lock) {
+      resetAccounting()
+      stopDeferred = false
+      delegateStopped = false
+      delegatePlaying = false
+      delegate.flush()
+    }
+  }
+
+  override fun stop() {
+    synchronized(lock) {
+      if (holding || bridging) {
+        // End of stream while paused or mid-seek. Stopping the track would end the bitstream, so
+        // the stop waits for the resume; nothing more will be written in the meantime anyway.
+        stopDeferred = true
+        return
+      }
+      forwardStop()
+    }
+  }
+
+  override fun release() {
+    if (canBridge() && park != null && park.invoke(this)) {
+      bridge("release")
+      // media3 is done with this output; answer its release now (its pending-release count must
+      // not stay open, see RawPositionOutputProvider) and let go of its listeners. The track
+      // itself lives on, parked, until the next request for the same config.
+      val notified = listeners.toList()
+      listeners.clear()
+      for (listener in notified) delegate.removeListener(listener)
+      for (listener in notified) listener.onReleased()
+      log?.invoke("info", "keepalive", "Parked while bridging; waiting for the next track of the same config")
+      return
+    }
+    releaseForReal("release")
+  }
+
+  /** Releases the delegate for real, ending any hold or bridge first. */
+  fun releaseForReal(reason: String) {
+    if (releasedForReal) return
+    releasedForReal = true
+    stopFeeder(reason)
+    synchronized(lock) {
+      delegatePlaying = false
+      delegate.release()
+    }
+  }
+
+  /** Whether a parked output can be handed back for the next track; logs the reacquire. */
+  fun reacquire(): Boolean {
+    if (broken || releasedForReal) return false
+    synchronized(lock) {
+      log?.invoke(
+        "info",
+        "keepalive",
+        "Reacquired after ${System.currentTimeMillis() - feedStartedMs}ms of bridging: wrote $unitsWritten units so far" +
+          if (!delegatePlaying) "; the track had been paused for real" else ""
+      )
+    }
+    return true
+  }
+
+  private fun canBridge(): Boolean = delegatePlaying && !delegateStopped && !broken
+
+  /**
+   * Bridges a seek: discards what the track still holds (the old position's tail and any hold
+   * silence), restarts it within milliseconds so the output never goes idle, and feeds silence
+   * until the first real write of the new position. media3 resets its written frames and its
+   * position tracker on this flush, and the accounting here restarts with them.
+   */
+  private fun bridge(reason: String) {
+    val wasHolding = holding
+    stopFeeder(reason)
+    synchronized(lock) {
+      val startedMs = System.currentTimeMillis()
+      delegate.pause() // AudioTrack.flush() is a no-op on a playing track
+      delegate.flush()
+      delegate.play()
+      val restartedMs = System.currentTimeMillis() - startedMs
+      resetAccounting()
+      stopDeferred = false
+      bridging = true
+      awaitingFirstRealWrite = true
+      stopRequested = false
+      unitsWritten = 0
+      feedStartedMs = startedMs
+      log?.invoke(
+        "info",
+        "keepalive",
+        "Bridging: ${silence.label} across the $reason${if (wasHolding) " that ended a hold" else ""}; " +
+          "the track was flushed and restarted in ${restartedMs}ms, silence starts at once"
+      )
+      startFeeder()
+    }
+  }
+
+  /** Starts a hold. The lock must be held. */
+  private fun engageHold(note: String?) {
+    positionAtPauseUs = getPositionUs()
+    holding = true
+    stopRequested = false
+    feedStartedMs = System.currentTimeMillis()
+    unitsWritten = 0
+    val queued = queuedFrames()
+    log?.invoke(
+      "info",
+      "keepalive",
+      "Engaged: ${silence.label}; ~${framesToUs(queued) / 1000}ms of real audio queued, " +
+        "silence starts once that drains to ${targetAheadFrames * 1000 / sampleRate}ms" +
+        if (note != null) " ($note)" else ""
+    )
+    startFeeder()
+  }
+
+  private fun startFeeder() {
+    if (!spawnFeederThread) return
+    feeder = Thread({ runFeeder() }, "plezy-keepalive").apply {
+      priority = Thread.MAX_PRIORITY
+      start()
+    }
+  }
+
+  /** The lock must be held. */
+  private fun forwardStop() {
+    stopDeferred = false
+    delegateStopped = true
+    delegatePlaying = false
+    delegate.stop()
+  }
+
+  /** The lock must be held. */
+  private fun resetAccounting() {
     realFramesWritten = 0
     silenceFramesWritten.set(0)
     framesPerAccessUnit = 0
     lastReportedUs = Long.MIN_VALUE
     positionAtPauseUs = Long.MIN_VALUE
     pendingUnit = null
-    delegatePaused = false
-    delegate.flush()
+    awaitingFirstRealWrite = false
   }
 
-  override fun stop() {
-    stopFeeder("stop")
-    delegate.stop()
-  }
-
-  override fun release() {
-    stopFeeder("release")
-    delegate.release()
-  }
-
-  /** Ends a hold and waits for the feeder to finish its unit; returns whether a hold was active. */
+  /**
+   * Ends a hold or bridge and waits for the feeder to finish its unit; returns whether one was
+   * active.
+   */
   private fun stopFeeder(reason: String): Boolean {
     val thread: Thread?
+    val wasBridging: Boolean
     synchronized(lock) {
-      if (!holding) return false
+      if (!holding && !bridging) return false
+      wasBridging = bridging
       stopRequested = true
       thread = feeder
       feeder = null
     }
     thread?.join(1_000L)
+    // Without a feeder thread (tests) the partial unit is completed here, so nothing real can be
+    // written between the halves of a silence unit.
+    if (thread == null) while (pendingUnit != null && feedOnce()) Unit
     synchronized(lock) {
       holding = false
+      bridging = false
       positionAtPauseUs = Long.MIN_VALUE
     }
-    log?.invoke(
-      "info",
-      "keepalive",
-      "Released ($reason) after ${System.currentTimeMillis() - holdStartedMs}ms: wrote $unitsWritten units this hold, " +
-        "${framesToUs(silenceFramesWritten.get()) / 1000}ms of silence since the track opened" +
-        if (delegatePaused) "; the track had been paused for real" else ""
-    )
+    val elapsedMs = System.currentTimeMillis() - feedStartedMs
+    val silenceMs = framesToUs(silenceFramesWritten.get()) / 1000
+    if (wasBridging) {
+      log?.invoke(
+        "info",
+        "keepalive",
+        "Bridge ended ($reason) after ${elapsedMs}ms: wrote $unitsWritten units, ${silenceMs}ms of silence queued ahead of the new position" +
+          if (!delegatePlaying) "; the track had been paused for real" else ""
+      )
+    } else {
+      log?.invoke(
+        "info",
+        "keepalive",
+        "Released ($reason) after ${elapsedMs}ms: wrote $unitsWritten units this hold, " +
+          "${silenceMs}ms of silence since the track opened" +
+          if (!delegatePlaying) "; the track had been paused for real" else ""
+      )
+    }
     return true
   }
 
@@ -331,7 +617,12 @@ internal class KeepAliveAudioOutput(
     try {
       while (true) {
         if (stopRequested && pendingUnit == null) return
+        if (bridging && pendingUnit == null && System.currentTimeMillis() - feedStartedMs >= bridgeTimeoutMs) {
+          pauseForReal("nobody came back for the bridge in ${bridgeTimeoutMs}ms")
+          return
+        }
         val wrote = feedOnce()
+        if (!delegatePlaying) return // the write failed and the track was paused for real
         if (!wrote) Thread.sleep(FEED_POLL_MS)
         // A head that stops moving while silence is accepted means the platform is dropping the
         // frames (a DTS frame too large for its IEC burst did exactly this): the receiver loses the
@@ -357,13 +648,23 @@ internal class KeepAliveAudioOutput(
     }
   }
 
+  /** Feeder-only: gives up on keeping the track alive and pauses it for real. */
+  private fun pauseForReal(reason: String) {
+    synchronized(lock) {
+      if (!delegatePlaying) return
+      delegatePlaying = false
+      delegate.pause()
+    }
+    log?.invoke("warn", "keepalive", "Paused the track for real: $reason")
+  }
+
   /**
    * One feeder step: completes a partial unit, or writes a fresh one when the queue is short.
    * Returns whether anything was written. On a write failure the delegate is paused for real
-   * and the hold ends.
+   * and the feeding ends.
    */
   fun feedOnce(): Boolean {
-    if (delegatePaused) return false
+    if (!delegatePlaying) return false
     val unit = pendingUnit ?: run {
       if (stopRequested) return false
       if (queuedFrames() >= targetAheadFrames) return false
@@ -373,10 +674,9 @@ internal class KeepAliveAudioOutput(
     val handled = try {
       delegate.write(unit, 1, 0L)
     } catch (e: AudioOutput.WriteException) {
-      log?.invoke("warn", "keepalive", "Silence write failed (${e.errorCode}); pausing the track for real")
       pendingUnit = null
-      delegatePaused = true
-      delegate.pause()
+      broken = true
+      pauseForReal("silence write failed (${e.errorCode})")
       return false
     }
     if (handled) {
@@ -398,6 +698,16 @@ internal class KeepAliveAudioOutput(
   private fun framesToUs(frames: Long): Long = frames * 1_000_000L / sampleRate
   private fun usToFrames(us: Long): Long = if (us <= 0L) 0L else us * sampleRate / 1_000_000L
 
+  override fun addListener(listener: AudioOutput.Listener) {
+    listeners.add(listener)
+    delegate.addListener(listener)
+  }
+
+  override fun removeListener(listener: AudioOutput.Listener) {
+    listeners.remove(listener)
+    delegate.removeListener(listener)
+  }
+
   override fun setVolume(volume: Float) = delegate.setVolume(volume)
   override fun isOffloadedPlayback() = delegate.isOffloadedPlayback()
   override fun getAudioSessionId() = delegate.getAudioSessionId()
@@ -405,8 +715,6 @@ internal class KeepAliveAudioOutput(
   override fun getBufferSizeInFrames() = delegate.getBufferSizeInFrames()
   override fun getPlaybackParameters() = delegate.getPlaybackParameters()
   override fun isStalled() = delegate.isStalled()
-  override fun addListener(listener: AudioOutput.Listener) = delegate.addListener(listener)
-  override fun removeListener(listener: AudioOutput.Listener) = delegate.removeListener(listener)
   override fun setPlaybackParameters(playbackParameters: PlaybackParameters) = delegate.setPlaybackParameters(playbackParameters)
   override fun setOffloadDelayPadding(delayInFrames: Int, paddingInFrames: Int) = delegate.setOffloadDelayPadding(delayInFrames, paddingInFrames)
   override fun setOffloadEndOfStream() = delegate.setOffloadEndOfStream()
@@ -418,5 +726,6 @@ internal class KeepAliveAudioOutput(
   private companion object {
     const val FEED_POLL_MS = 5L
     const val HEAD_STALL_CHECK_MS = 1_500L
+    const val BRIDGE_TIMEOUT_MS = 30_000L
   }
 }

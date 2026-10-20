@@ -14,6 +14,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -257,13 +258,309 @@ class PassthroughKeepAliveTest {
     assertTrue(logs.any { it.contains("Armed: ac3 silence") })
   }
 
+  // --- Seek bridging ---
+
+  /** A playing track, paused (held) and then flushed: the state every seek leaves behind. */
+  private fun seekDuringAHold(delegate: FakeOutput, output: KeepAliveAudioOutput) {
+    output.play()
+    repeat(4) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)) }
+    delegate.playedFrames = 1536L * 2
+    output.pause()
+    assertTrue(output.feedOnce())
+    delegate.events.clear()
+    output.flush()
+  }
+
+  @Test
+  fun aFlushDuringAHoldStartsABridge() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+
+    assertEquals("the track is flushed only while paused, then restarted at once", listOf("pause", "flush", "play"), delegate.events)
+    assertTrue(output.isBridging)
+    assertFalse(output.isHolding)
+    assertEquals("the accounting restarts with media3's", 0L, output.silenceFrames)
+    assertTrue("the flushed track is empty, so silence goes in without waiting", output.feedOnce())
+    assertEquals(1536L, output.silenceFrames)
+    assertTrue(delegate.writes.last().contentEquals(ByteArray(2560) { 0x51 }))
+    assertTrue(logs.any { it.contains("[keepalive] Bridging: ac3 silence") && it.contains("flush that ended a hold") })
+  }
+
+  @Test
+  fun aFlushOfAPlayingTrackAlsoBridges() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    delegate.events.clear()
+
+    output.flush()
+
+    assertEquals(listOf("pause", "flush", "play"), delegate.events)
+    assertTrue(output.isBridging)
+  }
+
+  @Test
+  fun aFlushOfAPausedTrackDoesNotBridge() {
+    val delegate = FakeOutput(sampleRate = 48_000, failWrites = true)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    output.pause()
+    assertFalse(output.feedOnce()) // the silence write fails and the track pauses for real
+    delegate.events.clear()
+
+    output.flush()
+
+    assertEquals("nothing to keep alive: a plain flush", listOf("flush"), delegate.events)
+    assertFalse(output.isBridging)
+  }
+
+  @Test
+  fun theFirstRealWriteEndsTheBridge() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    assertTrue(output.feedOnce())
+    assertTrue(output.feedOnce())
+    output.play() // the player reached READY before the renderer had anything to write
+
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+
+    assertFalse(output.isBridging)
+    assertFalse("the sink is playing, so no hold follows", output.isHolding)
+    assertEquals(1536L * 2, output.silenceFrames)
+    assertEquals(3, delegate.writes.size)
+    assertFalse("no more silence once real audio flows", output.feedOnce())
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertTrue(logs.any { it.contains("[keepalive] Bridge ended (first real write)") && it.contains("wrote 2 units") })
+  }
+
+  @Test
+  fun thePositionIsZeroWhileBridging() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+
+    assertEquals(0L, output.getPositionUs())
+    repeat(3) { assertTrue(output.feedOnce()) }
+    assertEquals("silence written ahead must not pull the clock below zero", 0L, output.getPositionUs())
+    delegate.playedFrames = 1536L * 2 // 64ms of bridge silence has played
+    assertEquals("played silence is invisible to the clock", 0L, output.getPositionUs())
+    delegate.playedFrames = 1536L * 50 // the head estimate overshoots everything written
+    assertEquals("nothing real was written, so nothing real can have played", 0L, output.getPositionUs())
+
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    delegate.playedFrames = 1536L * 3 // the three silence units have played, the real unit has not
+    assertEquals(0L, output.getPositionUs())
+    delegate.playedFrames = 1536L * 4 // and now the real unit has
+    assertEquals(32_000L, output.getPositionUs())
+  }
+
+  @Test
+  fun aPartialSilenceUnitCompletesBeforeTheRealWriteGoesThrough() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    delegate.acceptBytes = 1000
+    assertTrue(output.feedOnce()) // 1000 of 2560 bytes went in
+    assertEquals(0L, output.silenceFrames)
+    delegate.acceptBytes = Int.MAX_VALUE
+    output.play()
+
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+
+    assertEquals("the rest of the silence unit, then the real unit", listOf(1000, 1560, 2560), delegate.writes.map { it.size })
+    assertEquals(1536L, output.silenceFrames)
+    assertFalse(output.isBridging)
+  }
+
+  /**
+   * media3 writes the new position's first audio before it restarts the renderers, so the first
+   * real write lands while the sink is still paused. The track must not play on into it: the
+   * bridge becomes a hold, with that one unit keeping the renderer ready (written > position).
+   */
+  @Test
+  fun aBridgeWhoseSinkIsStillPausedTurnsIntoAHoldAtTheFirstRealWrite() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    assertTrue(output.feedOnce())
+
+    assertTrue("the first unit goes in", output.write(ac3AccessUnit(), 1, 0L))
+
+    assertFalse(output.isBridging)
+    assertTrue(output.isHolding)
+    assertFalse("the next one is refused until the sink plays", output.write(ac3AccessUnit(), 1, 0L))
+    assertEquals(0L, output.getPositionUs())
+    delegate.playedFrames = 1536L * 2 // the bridge silence and the real unit have played
+    assertEquals("frozen until play", 0L, output.getPositionUs())
+    assertFalse("the track never paused", delegate.paused)
+    assertEquals("the queue is short again, so the hold feeds silence", true, output.feedOnce())
+
+    output.play()
+    assertFalse(output.isHolding)
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertEquals("play never reached the still-playing track", 2, delegate.playCalls) // one from play(), one from the bridge
+  }
+
+  @Test
+  fun anEndOfStreamStopDuringAHoldWaitsForTheResume() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    output.pause()
+
+    output.stop()
+
+    assertFalse("stopping would end the bitstream", delegate.events.contains("stop"))
+    assertTrue(output.isHolding)
+    output.play()
+    assertFalse(output.isHolding)
+    assertEquals("the deferred stop goes through on the resume", "stop", delegate.events.last())
+  }
+
+  @Test
+  fun aReleasedBridgingOutputIsParkedAndHandedBackForTheSameConfig() {
+    val provider = FakeOutputProvider()
+    val wrapped = KeepAliveOutputProvider(provider, { true }, isCarrier = false, assets = assets, log = log, spawnFeederThread = false)
+    val output = wrapped.getAudioOutput(config()) as KeepAliveAudioOutput
+    val delegate = provider.outputs.single()
+    val listener = RecordingListener()
+    output.addListener(listener)
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    output.pause()
+    delegate.events.clear()
+
+    output.release()
+
+    assertEquals("the track is restarted, not released", listOf("pause", "flush", "play"), delegate.events)
+    assertTrue(output.isBridging)
+    assertEquals("media3's release is answered at once", 1, listener.releases)
+    assertEquals("and its listener no longer hangs off the track", 0, delegate.listeners.size)
+
+    assertSame("the next request for the same config gets the parked track back", output, wrapped.getAudioOutput(config()))
+    assertTrue(output.isBridging)
+    assertEquals(1, provider.outputs.size)
+    assertTrue(logs.any { it.contains("[keepalive] Reacquired after") })
+  }
+
+  @Test
+  fun aParkedOutputIsReleasedForRealWhenTheNextTrackDiffers() {
+    val provider = FakeOutputProvider()
+    val wrapped = KeepAliveOutputProvider(provider, { true }, isCarrier = false, assets = assets, log = log, spawnFeederThread = false)
+    val output = wrapped.getAudioOutput(config()) as KeepAliveAudioOutput
+    val delegate = provider.outputs.single()
+    output.play()
+    output.release()
+    assertTrue(output.isBridging)
+
+    val next = wrapped.getAudioOutput(config(channelMask = AudioFormat.CHANNEL_OUT_STEREO))
+
+    assertTrue(delegate.released)
+    assertFalse(output.isBridging)
+    assertTrue(next is KeepAliveAudioOutput && next !== output)
+    assertEquals(2, provider.outputs.size)
+  }
+
+  @Test
+  fun releasingTheProviderReleasesAParkedOutput() {
+    val provider = FakeOutputProvider()
+    val wrapped = KeepAliveOutputProvider(provider, { true }, isCarrier = false, assets = assets, log = log, spawnFeederThread = false)
+    val output = wrapped.getAudioOutput(config()) as KeepAliveAudioOutput
+    output.play()
+    output.release()
+
+    wrapped.release()
+
+    assertTrue(provider.outputs.single().released)
+    assertFalse(output.isBridging)
+    assertTrue(provider.released)
+  }
+
+  /** The carrier sink and the normal sink have their own providers but share one HDMI route. */
+  @Test
+  fun aTrackParkedByOneProviderIsReleasedWhenTheOtherBuildsItsOwn() {
+    val lot = KeepAliveParkingLot()
+    val rawProvider = FakeOutputProvider()
+    val carrierProvider = FakeOutputProvider()
+    val raw = KeepAliveOutputProvider(rawProvider, { true }, isCarrier = false, assets = assets, log = log, spawnFeederThread = false, lot = lot)
+    val carrier = KeepAliveOutputProvider(carrierProvider, { true }, isCarrier = true, assets = assets, log = log, spawnFeederThread = false, lot = lot)
+    val output = raw.getAudioOutput(config()) as KeepAliveAudioOutput
+    output.play()
+    output.release()
+    assertTrue(output.isBridging)
+
+    val carrierOutput = carrier.getAudioOutput(
+      config(encoding = AudioFormat.ENCODING_PCM_16BIT, sampleRate = 192_000, channelMask = AudioFormat.CHANNEL_OUT_7POINT1_SURROUND)
+    )
+
+    assertTrue("the parked AC3 track is gone before the carrier track exists", rawProvider.outputs.single().released)
+    assertFalse(output.isBridging)
+    assertTrue(carrierOutput is KeepAliveAudioOutput)
+    carrier.release()
+    assertTrue(carrierProvider.released)
+    assertFalse("a live track is media3's to release, not the provider's", carrierProvider.outputs.single().released)
+  }
+
+  @Test
+  fun aReleaseWithNowhereToParkGoesThrough() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence()) // no park callback
+    output.play()
+    output.pause()
+    assertTrue(output.feedOnce())
+
+    output.release()
+
+    assertTrue(delegate.released)
+    assertFalse(output.isBridging)
+    assertFalse(output.isHolding)
+  }
+
+  @Test
+  fun aBrokenTrackIsNotHandedBack() {
+    val provider = FakeOutputProvider()
+    val wrapped = KeepAliveOutputProvider(provider, { true }, isCarrier = false, assets = assets, log = log, spawnFeederThread = false)
+    val output = wrapped.getAudioOutput(config()) as KeepAliveAudioOutput
+    val delegate = provider.outputs.single()
+    output.play()
+    output.release()
+    delegate.failWrites = true
+    assertFalse(output.feedOnce()) // the bridge silence fails; the track pauses for real
+    assertTrue(delegate.paused)
+
+    val next = wrapped.getAudioOutput(config())
+
+    assertTrue(delegate.released)
+    assertTrue(next !== output)
+  }
+
+  private class RecordingListener : AudioOutput.Listener {
+    var releases = 0
+    override fun onPositionAdvancing(playoutStartSystemTimeMs: Long) = Unit
+    override fun onOffloadDataRequest() = Unit
+    override fun onOffloadPresentationEnded() = Unit
+    override fun onUnderrun() = Unit
+    override fun onReleased() {
+      releases++
+    }
+  }
+
   private class FakeOutputProvider : AudioOutputProvider {
+    val outputs = mutableListOf<FakeOutput>()
+    var released = false
     override fun getFormatSupport(formatConfig: AudioOutputProvider.FormatConfig) = throw UnsupportedOperationException()
     override fun getOutputConfig(config: AudioOutputProvider.FormatConfig): AudioOutputProvider.OutputConfig = throw UnsupportedOperationException()
-    override fun getAudioOutput(config: AudioOutputProvider.OutputConfig): AudioOutput = FakeOutput(config.sampleRate)
+    override fun getAudioOutput(config: AudioOutputProvider.OutputConfig): AudioOutput = FakeOutput(config.sampleRate).also { outputs.add(it) }
     override fun addListener(listener: AudioOutputProvider.Listener) = Unit
     override fun removeListener(listener: AudioOutputProvider.Listener) = Unit
-    override fun release() = Unit
+    override fun release() {
+      released = true
+    }
   }
 
   private class FakeOutput(
@@ -275,15 +572,20 @@ class PassthroughKeepAliveTest {
     var paused = false
     var playCalls = 0
     var flushed = false
+    var released = false
     val writes = mutableListOf<ByteArray>()
+    val events = mutableListOf<String>()
+    val listeners = mutableListOf<AudioOutput.Listener>()
 
     override fun play() {
       playCalls++
       paused = false
+      events.add("play")
     }
 
     override fun pause() {
       paused = true
+      events.add("pause")
     }
 
     override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
@@ -298,10 +600,18 @@ class PassthroughKeepAliveTest {
     override fun flush() {
       flushed = true
       playedFrames = 0
+      writes.clear() // whatever was queued is discarded
+      events.add("flush")
     }
 
-    override fun stop() = Unit
-    override fun release() = Unit
+    override fun stop() {
+      events.add("stop")
+    }
+
+    override fun release() {
+      released = true
+      events.add("release")
+    }
     override fun setVolume(volume: Float) = Unit
     override fun isOffloadedPlayback() = false
     override fun getAudioSessionId() = 0
@@ -310,8 +620,12 @@ class PassthroughKeepAliveTest {
     override fun getPositionUs(): Long = playedFrames * 1_000_000L / sampleRate
     override fun getPlaybackParameters(): PlaybackParameters = PlaybackParameters.DEFAULT
     override fun isStalled() = false
-    override fun addListener(listener: AudioOutput.Listener) = Unit
-    override fun removeListener(listener: AudioOutput.Listener) = Unit
+    override fun addListener(listener: AudioOutput.Listener) {
+      listeners.add(listener)
+    }
+    override fun removeListener(listener: AudioOutput.Listener) {
+      listeners.remove(listener)
+    }
     override fun setPlaybackParameters(playbackParameters: PlaybackParameters) = Unit
     override fun setOffloadDelayPadding(delayInFrames: Int, paddingInFrames: Int) = Unit
     override fun setOffloadEndOfStream() = Unit
