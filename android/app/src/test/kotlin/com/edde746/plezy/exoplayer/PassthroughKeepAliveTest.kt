@@ -244,6 +244,23 @@ class PassthroughKeepAliveTest {
   }
 
   @Test
+  fun aTrackThatDiesUnderTheFeederIsGivenUpRatherThanCrashingTheProcess() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    output.pause()
+    assertTrue(output.feedOnce())
+    // On a dead track media3's output has its provider reset the audio capabilities before it
+    // throws; the provider asserts the playback thread, which the feeder is not.
+    delegate.writeThrows = IllegalStateException("AudioTrackAudioOutputProvider accessed on multiple threads: ExoPlayer:Playback and null")
+
+    assertFalse(output.feedOnce())
+    assertTrue("the track is paused for real", delegate.paused)
+    assertFalse("and is not handed back after a seek", output.reacquire())
+    assertTrue(logs.toString(), logs.any { it.startsWith("warn") && "silence write failed (IllegalStateException" in it })
+  }
+
+  @Test
   fun flushResetsTheAccounting() {
     val delegate = FakeOutput(sampleRate = 48_000)
     val output = wrap(delegate, ac3Silence())
@@ -708,6 +725,8 @@ class PassthroughKeepAliveTest {
     var acceptBytes: Int = Int.MAX_VALUE,
     var failWrites: Boolean = false
   ) : AudioOutput {
+    /** When set, every write throws it, the way media3's output surfaces a dead track off the playback thread. */
+    var writeThrows: RuntimeException? = null
     var playedFrames = 0L
     /** When set, answers getPositionUs instead of [playedFrames]: a head media3 clamps to the frames written, say. */
     var positionFn: (() -> Long)? = null
@@ -733,6 +752,7 @@ class PassthroughKeepAliveTest {
 
     override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
       if (failWrites) throw AudioOutput.WriteException(-1, false)
+      writeThrows?.let { throw it }
       val n = minOf(buffer.remaining(), acceptBytes)
       val bytes = ByteArray(n)
       buffer.get(bytes)
