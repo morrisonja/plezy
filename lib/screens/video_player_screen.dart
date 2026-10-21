@@ -37,6 +37,7 @@ import '../database/app_database.dart';
 import '../media/media_version.dart';
 import '../models/transcode_quality_preset.dart';
 import '../media/media_source_info.dart';
+import '../media/passthrough_bitrate_hints.dart';
 import '../media/media_part_timeline.dart';
 import '../media/stepped_seek.dart';
 import '../mixins/mounted_set_state_mixin.dart';

@@ -270,6 +270,7 @@ class ExoPlayerPlugin :
       "setAudioNormalization" -> handleSetAudioNormalization(call, result)
       "setAudioPassthrough" -> handleSetAudioPassthrough(call, result)
       "setPassthroughKeepAlive" -> handleSetPassthroughKeepAlive(call, result)
+      "setPassthroughBitrateHints" -> handleSetPassthroughBitrateHints(call, result)
       "setAudioDownmix" -> handleSetAudioDownmix(call, result)
       "observeProperty" -> handleObserveProperty(call, result)
       "setMpvProperty" -> handleSetMpvProperty(call, result)
@@ -307,6 +308,7 @@ class ExoPlayerPlugin :
     dvConversionMode = call.argument<String>("dvConversionMode") ?: "auto"
     val audioPassthroughEnabled = call.argument<Boolean>("audioPassthroughEnabled") ?: false
     val passthroughKeepAliveEnabled = call.argument<Boolean>("passthroughKeepAliveEnabled") ?: false
+    val passthroughBitrateHints = call.argument<String>("passthroughBitrateHints") ?: ""
     val assVideoLatencyFrames = call.argument<Int>("assVideoLatencyFrames") ?: 0
     val subtitleRenderScale = call.argument<Double>("subtitleRenderScale")?.toFloat() ?: 1.0f
     // ExoPlayer-only: mpv's read-ahead is owned by the mpv.conf editor, so there is no
@@ -367,6 +369,7 @@ class ExoPlayerPlugin :
         }
         // Seed from this device's persisted calibration, falling back to the Dart perf-tier proxy.
         core.seedAssVideoLatencyFrames(assVideoLatencyFrames)
+        core.setPassthroughBitrateHints(passthroughBitrateHints)
         core.setVisible(false)
 
         Log.d(TAG, "Initialized: true")
@@ -1236,6 +1239,19 @@ class ExoPlayerPlugin :
     }
     activity?.runOnUiThread {
       playerCore?.setPassthroughKeepAlive(enabled)
+      result.success(true)
+    } ?: result.error("NO_ACTIVITY", "Activity not available", null)
+  }
+
+  private fun handleSetPassthroughBitrateHints(call: MethodCall, result: MethodChannel.Result) {
+    val hints = call.argument<String>("hints") ?: ""
+    // ExoPlayer-only: mpv sizes its own AudioTrack.
+    if (usingMpvFallback) {
+      result.success(true)
+      return
+    }
+    activity?.runOnUiThread {
+      playerCore?.setPassthroughBitrateHints(hints)
       result.success(true)
     } ?: result.error("NO_ACTIVITY", "Activity not available", null)
   }
