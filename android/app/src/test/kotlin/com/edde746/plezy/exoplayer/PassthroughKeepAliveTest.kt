@@ -61,8 +61,22 @@ class PassthroughKeepAliveTest {
     log = log
   )!!
 
+  /** The wrapper's wall clock; tests move it by hand. */
+  private var nowMs = 1_000_000L
+
   private fun wrap(delegate: FakeOutput, silence: KeepAliveSilence, sampleRate: Int = 48_000) =
-    KeepAliveAudioOutput(delegate, silence, sampleRate, log, targetAheadUs = 200_000L, spawnFeederThread = false)
+    KeepAliveAudioOutput(delegate, silence, sampleRate, log, targetAheadUs = 200_000L, spawnFeederThread = false, clock = { nowMs })
+
+  /**
+   * Lets the head grace after a restart pass and feeds silence until the queue is full, which
+   * includes the one verifying read of the head. Returns the units written.
+   */
+  private fun settleBridge(output: KeepAliveAudioOutput): Int {
+    nowMs += 150
+    var units = 0
+    while (output.feedOnce()) units++
+    return units
+  }
 
   /** A real AC3 access unit: media3 parses 1536 frames from a 48kHz syncframe header. */
   private fun ac3AccessUnit(): ByteBuffer = ByteBuffer.wrap(ByteArray(2560).also {
@@ -321,19 +335,19 @@ class PassthroughKeepAliveTest {
     val delegate = FakeOutput(sampleRate = 48_000)
     val output = wrap(delegate, ac3Silence())
     seekDuringAHold(delegate, output)
-    assertTrue(output.feedOnce())
-    assertTrue(output.feedOnce())
+    val units = settleBridge(output)
+    assertEquals("the 200ms target in 32ms units, once the real head (at zero) is read", 7, units)
     output.play() // the player reached READY before the renderer had anything to write
 
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
 
     assertFalse(output.isBridging)
     assertFalse("the sink is playing, so no hold follows", output.isHolding)
-    assertEquals(1536L * 2, output.silenceFrames)
-    assertEquals(3, delegate.writes.size)
+    assertEquals(1536L * units, output.silenceFrames)
+    assertEquals(units + 1, delegate.writes.size)
     assertFalse("no more silence once real audio flows", output.feedOnce())
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
-    assertTrue(logs.any { it.contains("[keepalive] Bridge ended (first real write)") && it.contains("wrote 2 units") })
+    assertTrue(logs.any { it.contains("[keepalive] Bridge ended (first real write)") && it.contains("wrote $units units") })
   }
 
   @Test
@@ -350,11 +364,15 @@ class PassthroughKeepAliveTest {
     delegate.playedFrames = 1536L * 50 // the head estimate overshoots everything written
     assertEquals("nothing real was written, so nothing real can have played", 0L, output.getPositionUs())
 
+    delegate.playedFrames = 0
+    val units = 3 + settleBridge(output)
+    delegate.playedFrames = 1536L * 50
+    assertEquals("still nothing real, whatever the head says", 0L, output.getPositionUs())
     output.play()
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
-    delegate.playedFrames = 1536L * 3 // the three silence units have played, the real unit has not
+    delegate.playedFrames = 1536L * units // the silence units have played, the real unit has not
     assertEquals(0L, output.getPositionUs())
-    delegate.playedFrames = 1536L * 4 // and now the real unit has
+    delegate.playedFrames = 1536L * (units + 1) // and now the real unit has
     assertEquals(32_000L, output.getPositionUs())
   }
 
@@ -363,16 +381,18 @@ class PassthroughKeepAliveTest {
     val delegate = FakeOutput(sampleRate = 48_000)
     val output = wrap(delegate, ac3Silence())
     seekDuringAHold(delegate, output)
+    val units = settleBridge(output)
+    delegate.playedFrames = 1536L * (units - 2) // the head has moved on and the queue is short again
     delegate.acceptBytes = 1000
     assertTrue(output.feedOnce()) // 1000 of 2560 bytes went in
-    assertEquals(0L, output.silenceFrames)
+    assertEquals(1536L * units, output.silenceFrames)
     delegate.acceptBytes = Int.MAX_VALUE
     output.play()
 
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
 
-    assertEquals("the rest of the silence unit, then the real unit", listOf(1000, 1560, 2560), delegate.writes.map { it.size })
-    assertEquals(1536L, output.silenceFrames)
+    assertEquals("the rest of the silence unit, then the real unit", listOf(1000, 1560, 2560), delegate.writes.takeLast(3).map { it.size })
+    assertEquals(1536L * (units + 1), output.silenceFrames)
     assertFalse(output.isBridging)
   }
 
@@ -386,7 +406,7 @@ class PassthroughKeepAliveTest {
     val delegate = FakeOutput(sampleRate = 48_000)
     val output = wrap(delegate, ac3Silence())
     seekDuringAHold(delegate, output)
-    assertTrue(output.feedOnce())
+    val units = settleBridge(output)
 
     assertTrue("the first unit goes in", output.write(ac3AccessUnit(), 1, 0L))
 
@@ -394,7 +414,7 @@ class PassthroughKeepAliveTest {
     assertTrue(output.isHolding)
     assertFalse("the next one is refused until the sink plays", output.write(ac3AccessUnit(), 1, 0L))
     assertEquals(0L, output.getPositionUs())
-    delegate.playedFrames = 1536L * 2 // the bridge silence and the real unit have played
+    delegate.playedFrames = 1536L * (units + 1) // the bridge silence and the real unit have played
     assertEquals("frozen until play", 0L, output.getPositionUs())
     assertFalse("the track never paused", delegate.paused)
     assertEquals("the queue is short again, so the hold feeds silence", true, output.feedOnce())
@@ -403,6 +423,126 @@ class PassthroughKeepAliveTest {
     assertFalse(output.isHolding)
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
     assertEquals("play never reached the still-playing track", 2, delegate.playCalls) // one from play(), one from the bridge
+  }
+
+  /**
+   * On a direct track the head comes from the HAL's render counter, which resets only when the
+   * audio thread gets to the flush; a read before that stores the pre-seek count and the reset
+   * then looks to media3 like a 32-bit wrap. So nothing reads the head for a grace period after
+   * a restart, real audio waits, and one read then checks that the counter did reset.
+   */
+  @Test
+  fun theHeadIsLeftUnreadAfterARestartAndCheckedOnce() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    delegate.positionReads = 0
+
+    assertEquals(0L, output.getPositionUs())
+    repeat(3) { assertTrue("silence is paced by the clock meanwhile", output.feedOnce()) }
+    assertFalse("real audio waits for the check", output.write(ac3AccessUnit(), 1, 0L))
+    nowMs += 149
+    assertEquals(0L, output.getPositionUs())
+    assertEquals("nothing reads the head during the grace", 0, delegate.positionReads)
+    assertTrue(output.isBridging)
+
+    nowMs += 1
+    while (output.feedOnce()) Unit
+    assertTrue(logs.any { it.contains("[keepalive] Playback head verified 150ms after the restart") })
+    assertTrue(delegate.positionReads > 0)
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertFalse(output.isBridging)
+  }
+
+  @Test
+  fun aStaleHeadAfterTheFlushIsFlushedAgain() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    // media3 clamps a wrapped head to exactly the frames written.
+    delegate.positionFn = { output.silenceFrames * 1_000_000L / 48_000 }
+    delegate.events.clear()
+
+    nowMs += 150
+    while (output.feedOnce()) Unit
+
+    assertEquals("flushed and restarted once more", listOf("pause", "flush", "play"), delegate.events)
+    assertTrue(logs.any { it.contains("[keepalive] Playback head stale 150ms after the flush") && it.contains("extra restart 1 of 3") })
+    assertTrue(output.isBridging)
+    assertFalse("and real audio keeps waiting", output.write(ac3AccessUnit(), 1, 0L))
+
+    delegate.positionFn = null // this time the counter did reset
+    nowMs += 150
+    while (output.feedOnce()) Unit
+    assertTrue(logs.any { it.contains("[keepalive] Playback head verified") && it.contains("(after 1 extra restart)") })
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertFalse(output.isBridging)
+  }
+
+  @Test
+  fun aHeadThatNeverResetsIsGivenUpOnAfterThreeExtraRestarts() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    delegate.positionFn = { output.silenceFrames * 1_000_000L / 48_000 }
+    delegate.events.clear()
+
+    repeat(3) {
+      nowMs += 150
+      while (output.feedOnce()) Unit
+    }
+    assertEquals(3, delegate.events.count { it == "flush" })
+    nowMs += 150
+
+    assertTrue("real audio flows again, out of sync rather than never", output.write(ac3AccessUnit(), 1, 0L))
+    assertTrue(logs.any { it.contains("giving up after 3 extra restarts") })
+    assertEquals("no fourth flush", 3, delegate.events.count { it == "flush" })
+    assertFalse(output.isBridging)
+  }
+
+  /**
+   * A stale counter that outlasts the grace poisons media3's tracker later: from then on the
+   * delegate's position sits exactly on the frames written. A second of that while real audio
+   * keeps arriving restarts the track; the discarded queue counts as played and the clock goes on
+   * from where it was.
+   */
+  @Test
+  fun aClockPinnedToTheWrittenFramesMidPlaybackRestartsTheTrack() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    var realUnits = 0
+    repeat(4) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)); realUnits++ }
+    delegate.playedFrames = 1536L * 2
+    assertEquals(64_000L, output.getPositionUs())
+
+    delegate.positionFn = { realUnits * 1536L * 1_000_000L / 48_000 } // the tracker took a wrap
+    assertEquals(128_000L, output.getPositionUs())
+    nowMs += 999
+    repeat(16) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)); realUnits++ } // 512ms of real audio arrives
+    assertEquals(640_000L, output.getPositionUs())
+    assertTrue("a second has not passed", delegate.events.none { it == "flush" })
+
+    nowMs += 1
+    assertEquals(640_000L, output.getPositionUs())
+
+    assertEquals(listOf("pause", "flush", "play"), delegate.events.takeLast(3))
+    assertTrue(output.isBridging)
+    assertTrue(logs.any { it.contains("[keepalive] The clock has sat on the frames written for 1000ms") })
+    assertTrue(logs.any { it.contains("[keepalive] Bridging: ac3 silence") && it.contains("across the stale clock") })
+    delegate.positionFn = null // the restarted track's head is sane
+    assertEquals("the clock goes on from where it was", 640_000L, output.getPositionUs())
+
+    val units = settleBridge(output)
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    realUnits++
+    assertFalse(output.isBridging)
+    assertFalse("the sink is playing, so no hold", output.isHolding)
+    assertEquals(640_000L, output.getPositionUs())
+    delegate.playedFrames = 1536L * units // the bridge silence has played
+    assertEquals(640_000L, output.getPositionUs())
+    delegate.playedFrames = 1536L * (units + 1) // and the first real unit after the restart
+    assertEquals(672_000L, output.getPositionUs())
   }
 
   @Test
@@ -569,6 +709,9 @@ class PassthroughKeepAliveTest {
     var failWrites: Boolean = false
   ) : AudioOutput {
     var playedFrames = 0L
+    /** When set, answers getPositionUs instead of [playedFrames]: a head media3 clamps to the frames written, say. */
+    var positionFn: (() -> Long)? = null
+    var positionReads = 0
     var paused = false
     var playCalls = 0
     var flushed = false
@@ -617,7 +760,10 @@ class PassthroughKeepAliveTest {
     override fun getAudioSessionId() = 0
     override fun getSampleRate() = sampleRate
     override fun getBufferSizeInFrames() = 48_000L
-    override fun getPositionUs(): Long = playedFrames * 1_000_000L / sampleRate
+    override fun getPositionUs(): Long {
+      positionReads++
+      return positionFn?.invoke() ?: (playedFrames * 1_000_000L / sampleRate)
+    }
     override fun getPlaybackParameters(): PlaybackParameters = PlaybackParameters.DEFAULT
     override fun isStalled() = false
     override fun addListener(listener: AudioOutput.Listener) {

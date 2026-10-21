@@ -51,6 +51,19 @@ import java.util.concurrent.atomic.AtomicLong
  * restarts at the bridge's flush, as media3's does: before the first real write the position
  * is zero, and bridge silence is subtracted like hold silence afterwards.
  *
+ * The playback head after a flush: on a direct track Android serves AudioTrack's head position
+ * from the HAL's render counter, which resets only when the audio thread gets to the flush, some
+ * tens of milliseconds after flush() returns (AOSP itself notes the position "may not be zero in
+ * STATE_FLUSHED due to hardware latency"). media3 resets its tracker at once, so a read in that
+ * window stores the pre-seek count and the reset that follows looks like a 32-bit wrap: 2^32
+ * frames are added for the life of the track, media3 clamps the position to the frames written,
+ * rejects the (correct) hardware timestamps that disagree, and video runs ahead of audio by the
+ * queue depth. So after a restart nobody reads the head for a grace period (the feeder paces its
+ * silence by the clock, real writes wait, the position stays put), then one read checks that the
+ * counter did reset; if not, the track is flushed and restarted again. Should a stale counter
+ * still slip through, a clock that sits exactly on the frames written for a whole second while
+ * real audio keeps arriving gives it away, and the track is restarted and bridged once more.
+ *
  * Known limitation: object formats (Atmos JOC, TrueHD Atmos, DTS:X) have no silence encoder.
  * Their carrier gets zero stuffing and their raw E-AC3 track gets plain E-AC3 silence, which
  * the receiver may treat as a format change.
@@ -272,7 +285,11 @@ internal class KeepAliveAudioOutput(
    */
   private val park: ((KeepAliveAudioOutput) -> Boolean)? = null,
   /** A bridge nobody comes back for is cut after this long and the track paused for real. */
-  private val bridgeTimeoutMs: Long = BRIDGE_TIMEOUT_MS
+  private val bridgeTimeoutMs: Long = BRIDGE_TIMEOUT_MS,
+  /** How long after a flush the playback head is left unread; see the class doc. */
+  private val headGraceMs: Long = HEAD_GRACE_MS,
+  /** Wall clock in ms; tests substitute their own. */
+  private val clock: () -> Long = System::currentTimeMillis
 ) : AudioOutput {
 
   private val lock = Any()
@@ -321,6 +338,33 @@ internal class KeepAliveAudioOutput(
   private var unitsWritten = 0L
   private var feedStartedMs = 0L
 
+  /** When the latest flush-and-restart of the delegate completed. */
+  private var restartedAtMs = 0L
+
+  /** The head is not read before this time; see the class doc on the head after a flush. */
+  @Volatile private var headUnreadableUntilMs = 0L
+
+  /** The first head read after the restart confirmed that the HAL's counter was reset. */
+  @Volatile private var headVerified = true
+
+  /** Extra flushes spent on a counter that had not reset; bounded by [MAX_EXTRA_RESTARTS]. */
+  private var restartAttempts = 0
+
+  /** The restarts were given up on: the clock may run ahead, and the pinned-clock watch stands down. */
+  private var headUnreliable = false
+
+  /**
+   * A restart the wrapper decided on itself (a stale clock mid-playback) discards real audio
+   * media3 has already written. Those frames count as played: the reports continue from
+   * [clockBaseUs], and only the real frames after [realFramesAtRestart] are in the delegate.
+   */
+  private var clockBaseUs = 0L
+  private var realFramesAtRestart = 0L
+
+  /** Pinned-clock watch: since when the delegate's position has sat on the frames written. */
+  private var pinnedSinceMs = Long.MIN_VALUE
+  private var realFramesAtPin = 0L
+
   /** Listeners registered through this wrapper, so a park can answer them and detach them. */
   private val listeners = ArrayList<AudioOutput.Listener>()
 
@@ -330,7 +374,13 @@ internal class KeepAliveAudioOutput(
 
   override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
     if (holding) return false
-    if (bridging) stopFeeder("first real write")
+    if (bridging) {
+      // Nothing real goes in until the head has been read once and found reset: a stale counter
+      // means another flush, which would discard it. Only the feeder restarts the track (it is
+      // the one writing to it); without a feeder (tests) this write may.
+      if (!maybeVerifyHead(allowRestart = feeder == null)) return false
+      stopFeeder("first real write")
+    }
     if (!silence.isPcm && framesPerAccessUnit == 0 && buffer.hasRemaining()) {
       framesPerAccessUnit = silence.framesPerAccessUnit(buffer)
     }
@@ -357,33 +407,83 @@ internal class KeepAliveAudioOutput(
   }
 
   override fun getPositionUs(): Long {
+    if (!headVerified) {
+      // The head is unreadable right after a restart (class doc), and nothing real has played
+      // since: the clock sits where the restart left it.
+      val frozen = if (lastReportedUs > clockBaseUs) lastReportedUs else clockBaseUs
+      lastReportedUs = frozen
+      return frozen
+    }
     val raw = delegate.getPositionUs()
     val silenceFrames = silenceFramesWritten.get()
-    if (silenceFrames == 0L && !holding) {
+    val reported: Long
+    if (silenceFrames == 0L && !holding && clockBaseUs == 0L) {
       // Remember it: the first silence unit is written ahead of play, and the guard below must
       // know where the clock was before that write.
-      lastReportedUs = raw
-      return raw
+      reported = raw
+    } else {
+      // The delegate's clock restarted at zero with the last flush; silence written since is
+      // subtracted, and a self-restart's reports continue from where the clock was.
+      var sinceRestartUs = raw - framesToUs(silenceFrames)
+      // A bridge writes silence into a freshly flushed track before any real audio: nothing real
+      // has played, so the clock is at zero, not below it.
+      if (sinceRestartUs < 0L) sinceRestartUs = 0L
+      var adjusted = clockBaseUs + sinceRestartUs
+      // While paused media3 counts the audio renderer as ready only while the sink still has
+      // pending data, i.e. the position is behind the frames written. A hold must therefore
+      // report a frozen clock, as a real pause does: if the head's estimate ever overshot and the
+      // reported position reached the written frames, the renderer would turn not-ready, the
+      // player would sit in BUFFERING, and its resume could never arrive to end the hold.
+      if (holding && positionAtPauseUs != Long.MIN_VALUE && adjusted > positionAtPauseUs) adjusted = positionAtPauseUs
+      // And at no time can more real audio have played than was written. Before the first real
+      // write after a seek this pins the clock at zero whatever the head reports.
+      val writtenUs = framesToUs(realFramesWritten)
+      if (adjusted > writtenUs) adjusted = writtenUs
+      // Silence is written ahead of being played, so the subtraction can dip below the last
+      // report; the clock must not run backwards.
+      reported = if (adjusted < lastReportedUs) lastReportedUs else adjusted
     }
-    var adjusted = raw - framesToUs(silenceFrames)
-    // A bridge writes silence into a freshly flushed track before any real audio: nothing real
-    // has played, so the clock is at zero, not below it.
-    if (adjusted < 0L) adjusted = 0L
-    // While paused media3 counts the audio renderer as ready only while the sink still has
-    // pending data, i.e. the position is behind the frames written. A hold must therefore
-    // report a frozen clock, as a real pause does: if the head's estimate ever overshot and the
-    // reported position reached the written frames, the renderer would turn not-ready, the
-    // player would sit in BUFFERING, and its resume could never arrive to end the hold.
-    if (holding && positionAtPauseUs != Long.MIN_VALUE && adjusted > positionAtPauseUs) adjusted = positionAtPauseUs
-    // And at no time can more real audio have played than was written. Before the first real
-    // write after a seek this pins the clock at zero whatever the head reports.
-    val writtenUs = framesToUs(realFramesWritten)
-    if (adjusted > writtenUs) adjusted = writtenUs
-    // Silence is written ahead of being played, so the subtraction can dip below the last
-    // report; the clock must not run backwards.
-    val reported = if (adjusted < lastReportedUs) lastReportedUs else adjusted
     lastReportedUs = reported
+    watchForPinnedClock(raw)
     return reported
+  }
+
+  /**
+   * A stale counter can also outlast the grace (a slow flush): the verification passes, and the
+   * wrap poisons media3's tracker later. From then on the delegate's position is clamped to the
+   * frames written, exactly, for the life of the track. A healthy track never does that for a
+   * whole second while real audio keeps arriving (an underrun clamps for a moment and the written
+   * frames then run ahead again), so that pattern restarts the track: its queue is discarded and
+   * bridged with silence, and the clock continues from where it was.
+   */
+  private fun watchForPinnedClock(rawUs: Long) {
+    if (!delegatePlaying || holding || bridging || delegateStopped || !sinkPlaying || headUnreliable) {
+      pinnedSinceMs = Long.MIN_VALUE
+      return
+    }
+    val writtenToDelegateUs = framesToUs(realFramesWritten - realFramesAtRestart + silenceFramesWritten.get())
+    if (rawUs < writtenToDelegateUs - 1_000L) {
+      pinnedSinceMs = Long.MIN_VALUE
+      return
+    }
+    val now = clock()
+    if (pinnedSinceMs == Long.MIN_VALUE) {
+      pinnedSinceMs = now
+      realFramesAtPin = realFramesWritten
+      return
+    }
+    val pinnedForMs = now - pinnedSinceMs
+    if (pinnedForMs < PINNED_CLOCK_MS) return
+    // Half the window's worth of real audio must have arrived meanwhile, or this is a stall.
+    if (realFramesWritten - realFramesAtPin < usToFrames(PINNED_CLOCK_MS * 500L)) return
+    pinnedSinceMs = Long.MIN_VALUE
+    log?.invoke(
+      "warn",
+      "keepalive",
+      "The clock has sat on the frames written for ${pinnedForMs}ms while real audio kept arriving: the playback head " +
+        "is stale (a 32-bit wrap after the last flush); restarting the track"
+    )
+    bridge("stale clock", keepClock = true)
   }
 
   override fun pause() {
@@ -480,7 +580,7 @@ internal class KeepAliveAudioOutput(
       log?.invoke(
         "info",
         "keepalive",
-        "Reacquired after ${System.currentTimeMillis() - feedStartedMs}ms of bridging: wrote $unitsWritten units so far" +
+        "Reacquired after ${clock() - feedStartedMs}ms of bridging: wrote $unitsWritten units so far" +
           if (!delegatePlaying) "; the track had been paused for real" else ""
       )
     }
@@ -493,31 +593,114 @@ internal class KeepAliveAudioOutput(
    * Bridges a seek: discards what the track still holds (the old position's tail and any hold
    * silence), restarts it within milliseconds so the output never goes idle, and feeds silence
    * until the first real write of the new position. media3 resets its written frames and its
-   * position tracker on this flush, and the accounting here restarts with them.
+   * position tracker on this flush, and the accounting here restarts with them. With [keepClock]
+   * (a restart the wrapper decided on itself, mid-playback) the discarded real audio counts as
+   * played and the clock continues from where it was.
    */
-  private fun bridge(reason: String) {
+  private fun bridge(reason: String, keepClock: Boolean = false) {
     val wasHolding = holding
     stopFeeder(reason)
     synchronized(lock) {
-      val startedMs = System.currentTimeMillis()
-      delegate.pause() // AudioTrack.flush() is a no-op on a playing track
-      delegate.flush()
-      delegate.play()
-      val restartedMs = System.currentTimeMillis() - startedMs
-      resetAccounting()
+      if (keepClock) {
+        clockBaseUs = if (lastReportedUs > 0L) lastReportedUs else 0L
+        realFramesAtRestart = realFramesWritten
+        lastReportedUs = clockBaseUs
+        positionAtPauseUs = Long.MIN_VALUE
+        awaitingFirstRealWrite = false
+      } else {
+        resetAccounting()
+      }
+      val restartedMs = restartTrack()
       stopDeferred = false
       bridging = true
       awaitingFirstRealWrite = true
       stopRequested = false
       unitsWritten = 0
-      feedStartedMs = startedMs
+      feedStartedMs = restartedAtMs
       log?.invoke(
         "info",
         "keepalive",
         "Bridging: ${silence.label} across the $reason${if (wasHolding) " that ended a hold" else ""}; " +
-          "the track was flushed and restarted in ${restartedMs}ms, silence starts at once"
+          "the track was flushed and restarted in ${restartedMs}ms, silence starts at once and the head is left unread for ${headGraceMs}ms"
       )
       startFeeder()
+    }
+  }
+
+  /**
+   * Flushes the playing delegate and restarts it within milliseconds, so the output never goes
+   * idle, and opens the head grace. Whatever silence was queued is gone with the flush. The lock
+   * must be held. Returns how long the restart took.
+   */
+  private fun restartTrack(): Long {
+    val startedMs = clock()
+    delegate.pause() // AudioTrack.flush() is a no-op on a playing track
+    delegate.flush()
+    delegate.play()
+    restartedAtMs = clock()
+    headUnreadableUntilMs = restartedAtMs + headGraceMs
+    headVerified = false
+    silenceFramesWritten.set(0)
+    pendingUnit = null
+    pinnedSinceMs = Long.MIN_VALUE
+    return restartedAtMs - startedMs
+  }
+
+  /**
+   * Once the grace has passed, reads the head once and checks it against what was written since
+   * the restart. Silence is kept about [targetAheadFrames] ahead and the HAL takes its time to
+   * restart, so a counter that was reset is well behind the frames written; a stale one makes
+   * media3 clamp the position to exactly those frames. Stale means another flush and restart
+   * (with [allowRestart]; otherwise the caller waits for the feeder to do it), up to
+   * [MAX_EXTRA_RESTARTS] times. Returns whether the head is usable.
+   */
+  private fun maybeVerifyHead(allowRestart: Boolean): Boolean {
+    if (headVerified) return true
+    if (clock() < headUnreadableUntilMs) return false
+    synchronized(lock) {
+      if (headVerified) return true
+      if (!delegatePlaying) {
+        headVerified = true // paused for real; there is nothing to verify
+        return true
+      }
+      val writtenFrames = realFramesWritten - realFramesAtRestart + silenceFramesWritten.get()
+      // Not enough queued yet to tell a reset counter from a stale one.
+      if (writtenFrames < targetAheadFrames) return false
+      val sinceRestartMs = clock() - restartedAtMs
+      val writtenUs = framesToUs(writtenFrames)
+      val headUs = delegate.getPositionUs()
+      if (headUs < writtenUs - framesToUs(targetAheadFrames) / 2) {
+        headVerified = true
+        log?.invoke(
+          "debug",
+          "keepalive",
+          "Playback head verified ${sinceRestartMs}ms after the restart: ${headUs / 1000}ms played of the ${writtenUs / 1000}ms written since" +
+            if (restartAttempts > 0) " (after $restartAttempts extra restart${if (restartAttempts > 1) "s" else ""})" else ""
+        )
+        return true
+      }
+      if (restartAttempts >= MAX_EXTRA_RESTARTS) {
+        headVerified = true
+        headUnreliable = true
+        log?.invoke(
+          "warn",
+          "keepalive",
+          "Playback head still reports the frames written ${sinceRestartMs}ms after the restart; giving up after " +
+            "$MAX_EXTRA_RESTARTS extra restarts, the clock may run ahead of the audio until the next seek"
+        )
+        return true
+      }
+      if (!allowRestart) return false
+      restartAttempts++
+      val restartedMs = restartTrack()
+      log?.invoke(
+        "warn",
+        "keepalive",
+        "Playback head stale ${sinceRestartMs}ms after the flush: it reports the ${writtenUs / 1000}ms written rather than what " +
+          "has played, so the HAL had not reset its counter when it was first read; flushed and restarted again in " +
+          "${restartedMs}ms (extra restart $restartAttempts of $MAX_EXTRA_RESTARTS)"
+      )
+      return false
     }
   }
 
@@ -526,7 +709,7 @@ internal class KeepAliveAudioOutput(
     positionAtPauseUs = getPositionUs()
     holding = true
     stopRequested = false
-    feedStartedMs = System.currentTimeMillis()
+    feedStartedMs = clock()
     unitsWritten = 0
     val queued = queuedFrames()
     log?.invoke(
@@ -564,6 +747,11 @@ internal class KeepAliveAudioOutput(
     positionAtPauseUs = Long.MIN_VALUE
     pendingUnit = null
     awaitingFirstRealWrite = false
+    clockBaseUs = 0L
+    realFramesAtRestart = 0L
+    restartAttempts = 0
+    headUnreliable = false
+    pinnedSinceMs = Long.MIN_VALUE
   }
 
   /**
@@ -589,7 +777,7 @@ internal class KeepAliveAudioOutput(
       bridging = false
       positionAtPauseUs = Long.MIN_VALUE
     }
-    val elapsedMs = System.currentTimeMillis() - feedStartedMs
+    val elapsedMs = clock() - feedStartedMs
     val silenceMs = framesToUs(silenceFramesWritten.get()) / 1000
     if (wasBridging) {
       log?.invoke(
@@ -611,13 +799,13 @@ internal class KeepAliveAudioOutput(
   }
 
   private fun runFeeder() {
-    var lastHeadUs = delegate.getPositionUs()
-    var headCheckedAtMs = System.currentTimeMillis()
+    var lastHeadUs = if (headVerified) delegate.getPositionUs() else Long.MIN_VALUE
+    var headCheckedAtMs = clock()
     var stallLogged = false
     try {
       while (true) {
         if (stopRequested && pendingUnit == null) return
-        if (bridging && pendingUnit == null && System.currentTimeMillis() - feedStartedMs >= bridgeTimeoutMs) {
+        if (bridging && pendingUnit == null && clock() - feedStartedMs >= bridgeTimeoutMs) {
           pauseForReal("nobody came back for the bridge in ${bridgeTimeoutMs}ms")
           return
         }
@@ -627,10 +815,13 @@ internal class KeepAliveAudioOutput(
         // A head that stops moving while silence is accepted means the platform is dropping the
         // frames (a DTS frame too large for its IEC burst did exactly this): the receiver loses the
         // stream and, worse, the subtracted silence never played, so the clock falls behind.
-        val now = System.currentTimeMillis()
-        if (now - headCheckedAtMs >= HEAD_STALL_CHECK_MS) {
+        val now = clock()
+        if (!headVerified) {
+          lastHeadUs = Long.MIN_VALUE
+          headCheckedAtMs = now
+        } else if (now - headCheckedAtMs >= HEAD_STALL_CHECK_MS) {
           val headUs = delegate.getPositionUs()
-          if (headUs == lastHeadUs && unitsWritten > 0 && !stallLogged) {
+          if (lastHeadUs != Long.MIN_VALUE && headUs == lastHeadUs && unitsWritten > 0 && !stallLogged) {
             stallLogged = true
             log?.invoke(
               "warn",
@@ -665,6 +856,8 @@ internal class KeepAliveAudioOutput(
    */
   fun feedOnce(): Boolean {
     if (!delegatePlaying) return false
+    maybeVerifyHead(allowRestart = true)
+    if (!delegatePlaying) return false
     val unit = pendingUnit ?: run {
       if (stopRequested) return false
       if (queuedFrames() >= targetAheadFrames) return false
@@ -689,10 +882,14 @@ internal class KeepAliveAudioOutput(
     return unit.remaining() != before
   }
 
-  /** Frames written (real and silence) that the playback head has not reached. */
+  /**
+   * Frames written since the last restart (real and silence) that the playback head has not
+   * reached. While the head is unreadable it is taken to have run at full rate since the restart,
+   * which it cannot have (the HAL takes a while to restart), so the queue is only ever deeper.
+   */
   private fun queuedFrames(): Long {
-    val headFrames = usToFrames(delegate.getPositionUs())
-    return realFramesWritten + silenceFramesWritten.get() - headFrames
+    val headFrames = if (headVerified) usToFrames(delegate.getPositionUs()) else usToFrames((clock() - restartedAtMs) * 1_000L)
+    return realFramesWritten - realFramesAtRestart + silenceFramesWritten.get() - headFrames
   }
 
   private fun framesToUs(frames: Long): Long = frames * 1_000_000L / sampleRate
@@ -727,5 +924,8 @@ internal class KeepAliveAudioOutput(
     const val FEED_POLL_MS = 5L
     const val HEAD_STALL_CHECK_MS = 1_500L
     const val BRIDGE_TIMEOUT_MS = 30_000L
+    const val HEAD_GRACE_MS = 150L
+    const val MAX_EXTRA_RESTARTS = 3
+    const val PINNED_CLOCK_MS = 1_000L
   }
 }
