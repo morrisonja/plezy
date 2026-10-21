@@ -35,9 +35,15 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Position accounting: silence played counts in the AudioTrack's head position but not in
  * media3's written frames, so [getPositionUs] subtracts every silence frame written. Real audio
- * already queued in the track at the moment of pause plays out before the silence starts; that
- * tail (up to one passthrough buffer) is heard after the pause press, and the clock resumes
- * after it. This is a known prototype artifact.
+ * already queued in the track at the moment of pause plays out before the silence starts, so
+ * that tail, one track buffer's worth, is heard after the pause press and the clock resumes
+ * after it. media3 sizes that buffer for the codec's highest bitrate, which for DD+ is seconds;
+ * [PassthroughBufferSizing] brings it back to half a second where the server reports the
+ * stream's bitrate. The feeder measures how far media3's reported head trails the track at
+ * each pause and feeds against the corrected depth ([lagFrames]); it fills the track to the
+ * brim whenever the head stops, since Android restarts a disabled or freshly flushed direct
+ * track only on a full buffer; and it first completes the access unit the pause cut in half,
+ * which would otherwise be heard as a burst of noise ahead of the silence.
  *
  * Seeks: media3 pauses the sink, releases the output, and asks for a new one only once the new
  * position has buffered, seconds later. A wrapper that is playing when it is flushed or released
@@ -250,6 +256,7 @@ internal class KeepAliveOutputProvider(
       silence,
       config.sampleRate,
       log,
+      bufferSizeBytes = config.bufferSize,
       spawnFeederThread = spawnFeederThread,
       park = { output ->
         if (released) {
@@ -277,6 +284,12 @@ internal class KeepAliveAudioOutput(
   private val log: ((String, String, String) -> Unit)?,
   /** How much audio (real tail plus silence) to keep queued ahead of the playback head. */
   targetAheadUs: Long = 200_000L,
+  /**
+   * The AudioTrack's buffer in bytes. media3 keeps it full while playing, so at a pause the
+   * frames it holds are known, and comparing them with the queue the head reports gives the
+   * head's lag; see [lagFrames].
+   */
+  private val bufferSizeBytes: Int = Int.MAX_VALUE,
   /** Tests drive [feedOnce] themselves instead of spawning the feeder thread. */
   private val spawnFeederThread: Boolean = true,
   /**
@@ -294,6 +307,28 @@ internal class KeepAliveAudioOutput(
 
   private val lock = Any()
   private val targetAheadFrames = targetAheadUs * sampleRate / 1_000_000L
+
+  /**
+   * How far the head media3 reports sits behind the track's own read point, in frames. media3's
+   * position is the presentation time (from the HAL's timestamps), which trails the bytes the
+   * HAL has already taken from the track by its own buffering, and it was seen to drift further
+   * behind with every pause. A queue measured against that head overstates what the track still
+   * holds by this much, so a feeder that waited for it to drain to the target let the track run
+   * dry: Android then disables the track and will not restart it until the whole buffer has been
+   * filled, which a feeder keeping 200ms ahead never does, and the receiver sees the stream come
+   * and go. Measured at each pause from the known buffer size and corrected at every full write.
+   */
+  @Volatile private var lagFrames = 0L
+
+  /** Real bytes written since the last restart, to turn the buffer's bytes into frames. */
+  private var realBytesWritten = 0L
+
+  /**
+   * The feeder is to fill the track to the brim regardless of the target: Android restarts a
+   * disabled or freshly flushed direct track only once its buffer is full.
+   */
+  @Volatile private var fillRequested = false
+  private var fillStartedUnits = 0L
 
   /** True between a keepalive pause and the join of its feeder; the renderer's writes are refused. */
   @Volatile private var holding = false
@@ -335,6 +370,23 @@ internal class KeepAliveAudioOutput(
 
   /** Feeder-only: a unit the delegate accepted partially; it must complete before anything else. */
   private var pendingUnit: ByteBuffer? = null
+
+  /** [pendingUnit] is the tail of a real access unit the pause cut, not silence; see [lastPartial]. */
+  private var pendingUnitIsReal = false
+  private var pendingRealCount = 0
+
+  /**
+   * What the last real write left in media3's buffer when the track was full. media3 keeps the
+   * track full, so the write just before a pause usually lands only partly, and a hold that then
+   * refused the rest would leave half an access unit in the track with silence right behind it:
+   * a decoder renders that as a burst of noise. The feeder completes the unit from this copy
+   * before any silence, and the retry media3 makes of the same bytes on resume is swallowed.
+   */
+  private var lastPartial: ByteArray? = null
+  private var lastPartialCount = 0
+
+  /** The tail the feeder completed, awaiting media3's retry of it; see [lastPartial]. */
+  private var realRemainder: ByteArray? = null
   private var unitsWritten = 0L
   private var feedStartedMs = 0L
 
@@ -371,9 +423,20 @@ internal class KeepAliveAudioOutput(
   val isHolding: Boolean get() = holding
   val isBridging: Boolean get() = bridging
   val silenceFrames: Long get() = silenceFramesWritten.get()
+  val realFrames: Long get() = realFramesWritten
 
   override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
     if (holding) return false
+    realRemainder?.let { tail ->
+      // media3 retries a partly written buffer before anything else, so its first write after a
+      // hold is the tail the feeder already completed. Take it without writing it again. Anything
+      // else means the retry is not coming (a seek discarded it).
+      realRemainder = null
+      if (buffer.remaining() == tail.size && ByteArray(tail.size).also { buffer.duplicate().get(it) }.contentEquals(tail)) {
+        buffer.position(buffer.limit())
+        return true
+      }
+    }
     if (bridging) {
       // Nothing real goes in until the head has been read once and found reset: a stale counter
       // means another flush, which would discard it. Only the feeder restarts the track (it is
@@ -386,10 +449,19 @@ internal class KeepAliveAudioOutput(
     }
     val before = buffer.remaining()
     val handled = delegate.write(buffer, encodedAccessUnitCount, presentationTimeUs)
+    // Bytes count on every write, partial ones included: media3 keeps the track full, so most
+    // real writes are partial and the retry carries only the remainder.
+    realBytesWritten += before - buffer.remaining()
     if (silence.isPcm) {
       realFramesWritten += (before - buffer.remaining()) / silence.pcmFrameSize
     } else if (handled) {
       realFramesWritten += framesPerAccessUnit.toLong() * encodedAccessUnitCount
+    }
+    if (!handled && buffer.hasRemaining()) {
+      lastPartial = ByteArray(buffer.remaining()).also { buffer.duplicate().get(it) }
+      lastPartialCount = encodedAccessUnitCount
+    } else {
+      lastPartial = null
     }
     if (awaitingFirstRealWrite && realFramesWritten > 0) {
       awaitingFirstRealWrite = false
@@ -711,15 +783,46 @@ internal class KeepAliveAudioOutput(
     stopRequested = false
     feedStartedMs = clock()
     unitsWritten = 0
+    fillRequested = false
+    val cutTail = lastPartial
+    if (cutTail != null && pendingUnit == null) {
+      pendingUnit = ByteBuffer.wrap(cutTail)
+      pendingUnitIsReal = true
+      pendingRealCount = lastPartialCount
+      lastPartial = null
+    }
     val queued = queuedFrames()
+    // media3 keeps the track full while playing, so what the queue shows beyond the buffer is
+    // the head's lag. A queue short of the buffer (paused while buffering, say) says nothing.
+    val held = bufferFrames()
+    lagFrames = if (queued > held) queued - held else 0L
     log?.invoke(
       "info",
       "keepalive",
-      "Engaged: ${silence.label}; ~${framesToUs(queued) / 1000}ms of real audio queued, " +
-        "silence starts once that drains to ${targetAheadFrames * 1000 / sampleRate}ms" +
+      "Engaged: ${silence.label}; ~${framesToUs(queued) / 1000}ms of real audio queued" +
+        (if (lagFrames > 0) " (the track holds ${framesToUs(held) / 1000}ms, the head reads ${framesToUs(lagFrames) / 1000}ms behind it)" else "") +
+        ", silence starts once that drains to ${targetAheadFrames * 1000 / sampleRate}ms" +
+        (if (cutTail != null) "; the ${cutTail.size}B tail of the access unit the pause cut goes in first" else "") +
         if (note != null) " ($note)" else ""
     )
     startFeeder()
+  }
+
+  /** The frames the track's buffer holds, at the real stream's bytes per frame. */
+  private fun bufferFrames(): Long {
+    if (bufferSizeBytes == Int.MAX_VALUE) return Long.MAX_VALUE / 4
+    if (silence.isPcm) return bufferSizeBytes.toLong() / silence.pcmFrameSize
+    val bytesPerFrame = if (realBytesWritten > 0 && realFramesWritten > 0) realBytesWritten.toDouble() / realFramesWritten
+    else silence.unit.size.toDouble() / silence.framesPerUnit
+    return (bufferSizeBytes / bytesPerFrame).toLong()
+  }
+
+  /** Has the feeder fill the track to the brim; see [fillRequested]. The lock need not be held. */
+  internal fun requestFill(reason: String) {
+    if (fillRequested) return
+    fillRequested = true
+    fillStartedUnits = unitsWritten
+    log?.invoke("warn", "keepalive", "Filling the track with silence: $reason")
   }
 
   private fun startFeeder() {
@@ -749,6 +852,12 @@ internal class KeepAliveAudioOutput(
     awaitingFirstRealWrite = false
     clockBaseUs = 0L
     realFramesAtRestart = 0L
+    realBytesWritten = 0L
+    lagFrames = 0L
+    fillRequested = false
+    pendingUnitIsReal = false
+    lastPartial = null
+    realRemainder = null
     restartAttempts = 0
     headUnreliable = false
     pinnedSinceMs = Long.MIN_VALUE
@@ -821,14 +930,25 @@ internal class KeepAliveAudioOutput(
           headCheckedAtMs = now
         } else if (now - headCheckedAtMs >= HEAD_STALL_CHECK_MS) {
           val headUs = delegate.getPositionUs()
-          if (lastHeadUs != Long.MIN_VALUE && headUs == lastHeadUs && unitsWritten > 0 && !stallLogged) {
-            stallLogged = true
-            log?.invoke(
-              "warn",
-              "keepalive",
-              "Playback head stuck at ${headUs / 1000}ms for ${now - headCheckedAtMs}ms while $unitsWritten silence units " +
-                "were accepted (${silence.label}); the platform is probably discarding them"
-            )
+          if (lastHeadUs != Long.MIN_VALUE && unitsWritten > 0 && isHeadStuck(lastHeadUs, headUs, now - headCheckedAtMs)) {
+            // A direct track that underran was disabled, and after a flush it has not started:
+            // either way Android plays nothing until the buffer is full, so fill it. A platform
+            // that discards the frames (a DTS frame too large for its IEC burst did) never
+            // reports the track full; the fill then gives up after two buffers' worth.
+            if (holding && !fillRequested) {
+              requestFill(
+                "the head has sat at ${headUs / 1000}ms for ${now - headCheckedAtMs}ms while $unitsWritten silence units " +
+                  "were accepted (${silence.label}), so the track is not playing"
+              )
+            } else if (!stallLogged) {
+              stallLogged = true
+              log?.invoke(
+                "warn",
+                "keepalive",
+                "Playback head stuck at ${headUs / 1000}ms for ${now - headCheckedAtMs}ms while $unitsWritten silence units " +
+                  "were accepted (${silence.label}); the platform is probably discarding them"
+              )
+            }
           }
           lastHeadUs = headUs
           headCheckedAtMs = now
@@ -864,12 +984,23 @@ internal class KeepAliveAudioOutput(
     if (!delegatePlaying) return false
     val unit = pendingUnit ?: run {
       if (stopRequested) return false
-      if (queuedFrames() >= targetAheadFrames) return false
+      if (fillRequested) {
+        if (unitsWritten - fillStartedUnits >= 2 * bufferFrames() / silence.framesPerUnit) {
+          fillRequested = false
+          log?.invoke("warn", "keepalive", "The track never reported full after two buffers of silence; giving up the fill")
+          return false
+        }
+      } else {
+        // While bridging nothing plays until the real audio fills the track, so the head has
+        // no lag to speak of; during a hold it does.
+        val lag = if (holding) lagFrames else 0L
+        if (queuedFrames() - lag >= targetAheadFrames) return false
+      }
       ByteBuffer.wrap(silence.unit)
     }
     val before = unit.remaining()
     val handled = try {
-      delegate.write(unit, 1, 0L)
+      delegate.write(unit, if (pendingUnitIsReal) pendingRealCount else 1, 0L)
     } catch (e: AudioOutput.WriteException) {
       pendingUnit = null
       broken = true
@@ -888,11 +1019,31 @@ internal class KeepAliveAudioOutput(
     }
     if (handled) {
       pendingUnit = null
-      silenceFramesWritten.addAndGet(silence.framesPerUnit.toLong())
-      unitsWritten++
+      if (pendingUnitIsReal) {
+        // The cut access unit is whole again; it counts as the real write it was.
+        pendingUnitIsReal = false
+        val tail = unit.array()
+        realBytesWritten += tail.size
+        realFramesWritten += if (silence.isPcm) (tail.size / silence.pcmFrameSize).toLong() else framesPerAccessUnit.toLong() * pendingRealCount
+        realRemainder = tail
+      } else {
+        silenceFramesWritten.addAndGet(silence.framesPerUnit.toLong())
+        unitsWritten++
+      }
       return true
     }
     pendingUnit = unit
+    // A partial write means the track is full, which is the one moment its contents are known:
+    // the head's lag is whatever the queue shows beyond the buffer.
+    if (holding) {
+      val queued = queuedFrames()
+      val held = bufferFrames()
+      lagFrames = if (queued > held) queued - held else 0L
+      if (fillRequested) {
+        fillRequested = false
+        log?.invoke("info", "keepalive", "The track is full again after ${unitsWritten - fillStartedUnits} units of silence")
+      }
+    }
     return unit.remaining() != before
   }
 
@@ -934,9 +1085,18 @@ internal class KeepAliveAudioOutput(
   override fun setAuxEffectSendLevel(level: Float) = delegate.setAuxEffectSendLevel(level)
   override fun setPreferredDevice(preferredDevice: AudioDeviceInfo?) = delegate.setPreferredDevice(preferredDevice)
 
-  private companion object {
+  internal companion object {
     const val FEED_POLL_MS = 5L
-    const val HEAD_STALL_CHECK_MS = 1_500L
+    const val HEAD_STALL_CHECK_MS = 500L
+
+    /**
+     * Whether a head that moved from [lastHeadUs] to [headUs] over [elapsedMs] belongs to a track
+     * that is not playing. media3's position is smoothed and extrapolated from the system clock,
+     * so a stopped track's head still creeps rather than freezing; less than half of real time
+     * is the test.
+     */
+    fun isHeadStuck(lastHeadUs: Long, headUs: Long, elapsedMs: Long): Boolean =
+      headUs - lastHeadUs < elapsedMs * 1_000L / 2
     const val BRIDGE_TIMEOUT_MS = 30_000L
     const val HEAD_GRACE_MS = 150L
     const val MAX_EXTRA_RESTARTS = 3

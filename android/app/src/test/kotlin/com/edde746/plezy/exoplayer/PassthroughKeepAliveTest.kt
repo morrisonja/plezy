@@ -64,8 +64,10 @@ class PassthroughKeepAliveTest {
   /** The wrapper's wall clock; tests move it by hand. */
   private var nowMs = 1_000_000L
 
-  private fun wrap(delegate: FakeOutput, silence: KeepAliveSilence, sampleRate: Int = 48_000) =
-    KeepAliveAudioOutput(delegate, silence, sampleRate, log, targetAheadUs = 200_000L, spawnFeederThread = false, clock = { nowMs })
+  private fun wrap(delegate: FakeOutput, silence: KeepAliveSilence, sampleRate: Int = 48_000, bufferSizeBytes: Int = Int.MAX_VALUE) =
+    KeepAliveAudioOutput(
+      delegate, silence, sampleRate, log, targetAheadUs = 200_000L, bufferSizeBytes = bufferSizeBytes, spawnFeederThread = false, clock = { nowMs }
+    )
 
   /**
    * Lets the head grace after a restart pass and feeds silence until the queue is full, which
@@ -153,6 +155,128 @@ class PassthroughKeepAliveTest {
     assertTrue(output.feedOnce())
     assertFalse("the queue is back above target", output.feedOnce())
     assertEquals(1536L * 2, output.silenceFrames)
+  }
+
+  @Test
+  fun theHeadsLagBehindTheTrackIsMeasuredAtThePauseAndFedAgainst() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    // A buffer of 20 access units (640ms); media3 keeps it full while playing.
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 20)
+    output.play()
+    repeat(28) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)) }
+    // The head media3 reports says 896ms are queued, but the track holds 640ms: it reads 256ms behind.
+    output.pause()
+    assertTrue(logs.toString(), logs.last().contains("~896ms of real audio queued (the track holds 640ms, the head reads 256ms behind it)"))
+
+    // 13 units played per the head: 480ms queued, really 224ms, still above the 200ms target.
+    delegate.playedFrames = 1536L * 13
+    assertFalse(output.feedOnce())
+    // 14 units: 448ms per the head, really 192ms, so silence goes in. Without the correction the
+    // feeder would have waited another 256ms, past the point where the track ran dry.
+    delegate.playedFrames = 1536L * 14
+    assertTrue(output.feedOnce())
+    assertEquals(1536L, output.silenceFrames)
+  }
+
+  @Test
+  fun theLagIsMeasuredCorrectlyWhenTheRealWritesWerePartial() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 20)
+    output.play()
+    // Every real unit lands in two halves, the way media3 writes against a full track.
+    repeat(28) {
+      val unit = ac3AccessUnit()
+      delegate.acceptBytes = 1280
+      assertFalse(output.write(unit, 1, 0L))
+      delegate.acceptBytes = Int.MAX_VALUE
+      assertTrue(output.write(unit, 1, 0L))
+    }
+    output.pause()
+    assertTrue(logs.toString(), logs.last().contains("(the track holds 640ms, the head reads 256ms behind it)"))
+  }
+
+  @Test
+  fun aCreepingHeadCountsAsStuck() {
+    // A stopped track whose smoothed position still inches forward.
+    assertTrue(KeepAliveAudioOutput.isHeadStuck(1_000_000L, 1_040_000L, 500L))
+    assertTrue(KeepAliveAudioOutput.isHeadStuck(1_000_000L, 1_000_000L, 500L))
+    // A playing track, even one reported a little slow.
+    assertFalse(KeepAliveAudioOutput.isHeadStuck(1_000_000L, 1_450_000L, 500L))
+    assertFalse(KeepAliveAudioOutput.isHeadStuck(1_000_000L, 1_500_000L, 500L))
+  }
+
+  @Test
+  fun aPauseCompletesTheAccessUnitItCutAndSwallowsMedia3sRetryOfIt() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    output.play()
+    repeat(3) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)) }
+    // The track is full: the fourth unit goes in only partly, as media3's last write before a
+    // pause usually does.
+    val cut = ac3AccessUnit()
+    delegate.acceptBytes = 1000
+    assertFalse(output.write(cut, 1, 0L))
+    assertEquals(1560, cut.remaining())
+    delegate.acceptBytes = Int.MAX_VALUE
+    assertEquals(1536L * 3, output.realFrames)
+
+    output.pause()
+    assertTrue(logs.toString(), logs.last().contains("the 1560B tail of the access unit the pause cut goes in first"))
+    // The feeder's first write is that tail, not silence, whatever the queue says.
+    assertTrue(output.feedOnce())
+    assertEquals(1560, delegate.writes.last().size)
+    assertEquals(0L, output.silenceFrames)
+    assertEquals("the unit counts as real audio once whole", 1536L * 4, output.realFrames)
+
+    // On resume media3 retries the same bytes: taken, not written again.
+    output.play()
+    val writesBefore = delegate.writes.size
+    assertTrue(output.write(cut, 1, 0L))
+    assertFalse(cut.hasRemaining())
+    assertEquals(writesBefore, delegate.writes.size)
+    assertEquals(1536L * 4, output.realFrames)
+    // A fresh unit is written as usual.
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertEquals(writesBefore + 1, delegate.writes.size)
+  }
+
+  @Test
+  fun aRequestedFillWritesPastTheTargetUntilTheTrackReportsFull() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 20)
+    output.play()
+    repeat(20) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)) }
+    output.pause()
+    assertFalse("640ms queued is above the target", output.feedOnce())
+
+    // The feeder found the head stuck (a disabled track): fill the track regardless.
+    output.requestFill("test")
+    assertTrue(output.feedOnce())
+    assertTrue(output.feedOnce())
+    assertEquals(1536L * 2, output.silenceFrames)
+    assertTrue(logs.any { it.startsWith("warn") && it.contains("Filling the track with silence: test") })
+
+    // The track reports full with a partial write: the fill ends and the lag is re-measured.
+    delegate.acceptBytes = 1000
+    assertTrue("the partial unit counts as progress", output.feedOnce())
+    assertTrue(logs.any { it.contains("The track is full again after 2 units of silence") })
+    delegate.acceptBytes = Int.MAX_VALUE
+    assertTrue("the partial unit is completed", output.feedOnce())
+    assertFalse("and then the target applies again", output.feedOnce())
+  }
+
+  @Test
+  fun aFillGivesUpAfterTwoBuffersOfSilenceWhenTheTrackNeverFills() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 4)
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    output.pause()
+    output.requestFill("test")
+    var units = 0
+    while (output.feedOnce()) units++
+    assertEquals("two buffers' worth of units", 8, units)
+    assertTrue(logs.any { it.contains("giving up the fill") })
   }
 
   @Test
