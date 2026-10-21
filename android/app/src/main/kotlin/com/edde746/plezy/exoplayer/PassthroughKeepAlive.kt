@@ -836,6 +836,10 @@ internal class KeepAliveAudioOutput(
       }
     } catch (_: InterruptedException) {
       // stopFeeder's join timed out; leave quietly.
+    } catch (e: RuntimeException) {
+      // Nothing thrown on this thread may reach the process.
+      broken = true
+      pauseForReal("the feeder failed (${e.javaClass.simpleName}: ${e.message})")
     }
   }
 
@@ -870,6 +874,16 @@ internal class KeepAliveAudioOutput(
       pendingUnit = null
       broken = true
       pauseForReal("silence write failed (${e.errorCode})")
+      return false
+    } catch (e: RuntimeException) {
+      // A track that dies under the feeder (the HDMI link renegotiated, say) makes media3's output
+      // tell its provider to reset the audio capabilities before it throws its WriteException, and
+      // the provider insists on the playback thread: here that is an IllegalStateException, which
+      // left uncaught would take the process down. The track is given up; the next real write, on
+      // the playback thread, hits the same dead track and media3 recovers in its own way.
+      pendingUnit = null
+      broken = true
+      pauseForReal("silence write failed (${e.javaClass.simpleName}: ${e.message})")
       return false
     }
     if (handled) {
