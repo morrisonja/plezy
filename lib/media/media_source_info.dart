@@ -122,6 +122,9 @@ class MediaAudioTrack with _TrackLabelMixin {
   final String? title;
   final String? displayTitle;
   final int? channels;
+
+  /// The stream's bitrate as the server reports it, when it does.
+  final int? bitrateKbps;
   final bool selected;
 
   /// Container fallback, independent of the server/user-selected row.
@@ -137,6 +140,7 @@ class MediaAudioTrack with _TrackLabelMixin {
     this.title,
     this.displayTitle,
     this.channels,
+    this.bitrateKbps,
     required this.selected,
     this.isDefault = false,
     this.external = false,
@@ -155,6 +159,7 @@ class MediaAudioTrack with _TrackLabelMixin {
       title: title,
       displayTitle: displayTitle,
       channels: channels,
+      bitrateKbps: bitrateKbps,
       selected: selected,
       isDefault: isDefault,
       external: external,

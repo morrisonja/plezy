@@ -53,6 +53,12 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
    */
   var passthroughKeepAliveEnabled: (() -> Boolean)? = null
 
+  /**
+   * The server's audio stream bitrates for the current item, which size an E-AC-3 passthrough
+   * buffer for the stream instead of the codec's ceiling; see [PassthroughBufferSizing].
+   */
+  internal var passthroughBitrateHints: (() -> List<AudioBitrateHint>)? = null
+
   private val silenceAssets = SilenceAssets(context)
 
   /** One parked keepalive track per player, shared by both sinks' providers. */
@@ -179,7 +185,7 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
   ): AudioSink {
     // Media3 1.11's replacement is fixed at 500ms; preserve the dynamic 500–1000ms PCM policy.
     @Suppress("DEPRECATION")
-    val bufferSizeProvider = DefaultAudioTrackBufferSizeProvider.Builder()
+    val media3BufferSizeProvider = DefaultAudioTrackBufferSizeProvider.Builder()
       .setMinPcmBufferDurationUs(500_000)
       .setMaxPcmBufferDurationUs(1_000_000)
       .setPcmBufferMultiplicationFactor(4)
@@ -188,6 +194,13 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
       // now uses the same one-second floor for its last-resort retry (#3207).
       .setPassthroughBufferDurationUs(500_000)
       .build()
+    // That half second is measured at the codec's highest bitrate; for E-AC-3 the server's
+    // reported bitrate brings it back to half a second of the actual stream.
+    val bufferSizeProvider = HintedPassthroughBufferSizeProvider(
+      media3BufferSizeProvider,
+      hints = { passthroughBitrateHints?.invoke() ?: emptyList() },
+      log = audioDiagnosticsLogger
+    )
 
     val realProvider = KeepAliveOutputProvider(
       AudioTrackAudioOutputProvider.Builder(context)
@@ -250,7 +263,7 @@ class PlezyRenderersFactory(context: Context) : DefaultRenderersFactory(context)
    */
   private fun buildCarrierSink(
     context: Context,
-    bufferSizeProvider: DefaultAudioTrackBufferSizeProvider
+    bufferSizeProvider: DefaultAudioSink.AudioTrackBufferSizeProvider
   ): AudioSink {
     val trackProvider = AudioTrackAudioOutputProvider.Builder(context)
       .setAudioTrackBufferSizeProvider(bufferSizeProvider)

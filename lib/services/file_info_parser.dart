@@ -29,6 +29,7 @@ typedef JellyfinStreamFields = ({
   bool isExternal,
   String? deliveryUrl,
   int? channels,
+  int? bitrateKbps,
   double? frameRate,
 });
 
@@ -51,6 +52,7 @@ JellyfinStreamFields parseJellyfinStreamFields(Map<String, dynamic> s, {int fall
     isExternal: isExternalFile || usesExternalDelivery,
     deliveryUrl: s['DeliveryUrl'] as String?,
     channels: flexibleInt(s['Channels']),
+    bitrateKbps: bitrateKbpsFromBps(flexibleInt(s['BitRate'])),
     frameRate: flexibleDouble(s['RealFrameRate']) ?? flexibleDouble(s['AverageFrameRate']),
   );
 }
@@ -153,6 +155,8 @@ class PlexFileInfoStreamReader implements FileInfoStreamReader {
       title: stream['title'] as String?,
       displayTitle: stream['displayTitle'] as String?,
       channels: flexibleInt(stream['channels']),
+      // Plex already reports stream bitrates in kbps.
+      bitrateKbps: flexibleInt(stream['bitrate']),
       selected: flexibleBool(stream['selected']),
       isDefault: flexibleBool(stream['default']),
     );
@@ -206,6 +210,7 @@ class JellyfinFileInfoStreamReader implements FileInfoStreamReader {
       title: f.title,
       displayTitle: f.displayTitle,
       channels: f.channels,
+      bitrateKbps: f.bitrateKbps,
       selected: f.isDefault,
       isDefault: f.isDefault,
       external: f.isExternal,

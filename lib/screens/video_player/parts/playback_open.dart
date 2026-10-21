@@ -1090,6 +1090,16 @@ extension _VideoPlayerOpenMethods on VideoPlayerScreenState {
         partTimeline: result.mediaInfo?.partTimeline,
       );
       if (!isCurrent()) return false;
+      if (currentPlayer is PlayerAndroid) {
+        // Source-side only, as with content-frame-rate: a transcode's audio is whatever the
+        // server encodes. The stream bitrates let ExoPlayer size a DD+ passthrough buffer for
+        // the stream rather than the codec's ceiling, which is what a pause otherwise plays out.
+        await currentPlayer.setProperty(
+          'passthrough-bitrate-hints',
+          result.isTranscoding ? '' : passthroughBitrateHintSpec(result.mediaInfo?.audioTracks ?? const []),
+        );
+        if (!isCurrent()) return false;
+      }
       final openResult = await _openMediaOnPlayer(
         player: currentPlayer,
         settingsService: settingsService,

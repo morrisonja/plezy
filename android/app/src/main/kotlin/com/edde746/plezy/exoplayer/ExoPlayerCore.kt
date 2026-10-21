@@ -256,6 +256,11 @@ class ExoPlayerCore(private val activity: Activity) :
   // receiver does not drop and re-lock the stream (see KeepAliveAudioOutput). Applies to
   // AudioTracks created after it changes.
   private var passthroughKeepAliveEnabled: Boolean = false
+
+  // The server's audio stream bitrates for the current item (codec, channels, kbps), which size
+  // an E-AC-3 passthrough buffer for the stream rather than the codec's ceiling; see
+  // PassthroughBufferSizing. Applies to AudioTracks created after it changes.
+  private var passthroughBitrateHints: List<AudioBitrateHint> = emptyList()
   private var audioNormalizationEnabled: Boolean = false
 
   // Stereo downmix: runs as a ChannelMixingAudioProcessor inside the sink's
@@ -705,6 +710,7 @@ class ExoPlayerCore(private val activity: Activity) :
         shouldBlockDirectAudioOutput = { format -> this@ExoPlayerCore.shouldBlockDirectAudioOutput(format, "sink support") }
         // `this.` because initialize()'s parameter of the same name shadows the factory's property.
         this.passthroughKeepAliveEnabled = { this@ExoPlayerCore.passthroughKeepAliveEnabled }
+        passthroughBitrateHints = { this@ExoPlayerCore.passthroughBitrateHints }
         onAudioCapabilitiesChanged = { updateAudioDecoderPolicy("audio capabilities changed") }
         setEnableDecoderFallback(true)
         setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
@@ -3600,6 +3606,20 @@ class ExoPlayerCore(private val activity: Activity) :
     if (passthroughKeepAliveEnabled == enabled) return
     passthroughKeepAliveEnabled = enabled
     emitLog("info", "keepalive", "Passthrough keepalive ${if (enabled) "enabled" else "disabled"}; applies to the next audio track")
+  }
+
+  /** Takes the `codec:channels:kbps,...` list Dart sends for the item about to open. */
+  fun setPassthroughBitrateHints(spec: String) {
+    val hints = PassthroughBufferSizing.parse(spec)
+    if (hints == passthroughBitrateHints) return
+    passthroughBitrateHints = hints
+    emitLog(
+      "info",
+      "audio",
+      if (hints.isEmpty()) "Passthrough bitrate hints cleared"
+      else "Passthrough bitrate hints: " + hints.joinToString { "${it.codec} ${it.channels}ch ${it.bitrateKbps}kbps" } +
+        "; size the next E-AC-3 track's buffer"
+    )
   }
 
   fun setAudioPassthrough(enabled: Boolean) {
