@@ -64,10 +64,16 @@ class PassthroughKeepAliveTest {
   /** The wrapper's wall clock; tests move it by hand. */
   private var nowMs = 1_000_000L
 
-  private fun wrap(delegate: FakeOutput, silence: KeepAliveSilence, sampleRate: Int = 48_000, bufferSizeBytes: Int = Int.MAX_VALUE) =
-    KeepAliveAudioOutput(
-      delegate, silence, sampleRate, log, targetAheadUs = 200_000L, bufferSizeBytes = bufferSizeBytes, spawnFeederThread = false, clock = { nowMs }
-    )
+  private fun wrap(delegate: FakeOutput, silence: KeepAliveSilence, sampleRate: Int = 48_000, bufferSizeBytes: Int = Int.MAX_VALUE) = KeepAliveAudioOutput(
+    delegate,
+    silence,
+    sampleRate,
+    log,
+    targetAheadUs = 200_000L,
+    bufferSizeBytes = bufferSizeBytes,
+    spawnFeederThread = false,
+    clock = { nowMs }
+  )
 
   /**
    * Lets the head grace after a restart pass and feeds silence until the queue is full, which
@@ -81,10 +87,14 @@ class PassthroughKeepAliveTest {
   }
 
   /** A real AC3 access unit: media3 parses 1536 frames from a 48kHz syncframe header. */
-  private fun ac3AccessUnit(): ByteBuffer = ByteBuffer.wrap(ByteArray(2560).also {
-    it[0] = 0x0b; it[1] = 0x77; it[4] = 0x3e // fscod=48k, frmsizecod for 640kbps
-    it[5] = 0x40 // bsid 8: a plain AC3 header, which media3 reads as 1536 frames
-  })
+  private fun ac3AccessUnit(): ByteBuffer = ByteBuffer.wrap(
+    ByteArray(2560).also {
+      it[0] = 0x0b
+      it[1] = 0x77
+      it[4] = 0x3e // fscod=48k, frmsizecod for 640kbps
+      it[5] = 0x40 // bsid 8: a plain AC3 header, which media3 reads as 1536 frames
+    }
+  )
 
   @Test
   fun silenceSelectionFollowsEncodingLayoutAndRate() {
@@ -776,14 +786,20 @@ class PassthroughKeepAliveTest {
     val output = wrap(delegate, ac3Silence())
     output.play()
     var realUnits = 0
-    repeat(4) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)); realUnits++ }
+    repeat(4) {
+      assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+      realUnits++
+    }
     delegate.playedFrames = 1536L * 2
     assertEquals(64_000L, output.getPositionUs())
 
     delegate.positionFn = { realUnits * 1536L * 1_000_000L / 48_000 } // the tracker took a wrap
     assertEquals(128_000L, output.getPositionUs())
     nowMs += 999
-    repeat(16) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)); realUnits++ } // 512ms of real audio arrives
+    repeat(16) {
+      assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+      realUnits++
+    } // 512ms of real audio arrives
     assertEquals(640_000L, output.getPositionUs())
     assertTrue("a second has not passed", delegate.events.none { it == "flush" })
 
@@ -975,6 +991,7 @@ class PassthroughKeepAliveTest {
     /** When set, every write throws it, the way media3's output surfaces a dead track off the playback thread. */
     var writeThrows: RuntimeException? = null
     var playedFrames = 0L
+
     /** When set, answers getPositionUs instead of [playedFrames]: a head media3 clamps to the frames written, say. */
     var positionFn: (() -> Long)? = null
     var positionReads = 0

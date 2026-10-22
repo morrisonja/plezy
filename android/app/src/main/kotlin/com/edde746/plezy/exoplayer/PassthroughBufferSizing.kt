@@ -82,7 +82,13 @@ internal class HintedPassthroughBufferSizeProvider(
     maxAudioTrackPlaybackSpeed: Double
   ): Int {
     val default = delegate.getBufferSizeInBytes(
-      minBufferSizeInBytes, encoding, outputMode, pcmFrameSize, sampleRate, bitrate, maxAudioTrackPlaybackSpeed
+      minBufferSizeInBytes,
+      encoding,
+      outputMode,
+      pcmFrameSize,
+      sampleRate,
+      bitrate,
+      maxAudioTrackPlaybackSpeed
     )
     if (outputMode != DefaultAudioSink.OUTPUT_MODE_PASSTHROUGH || bitrate != Format.NO_VALUE) return default
     val hinted = PassthroughBufferSizing.hintedBitrateBps(encoding, hints())
@@ -90,7 +96,13 @@ internal class HintedPassthroughBufferSizeProvider(
     val sized = min(
       default,
       delegate.getBufferSizeInBytes(
-        minBufferSizeInBytes, encoding, outputMode, pcmFrameSize, sampleRate, hinted, maxAudioTrackPlaybackSpeed
+        minBufferSizeInBytes,
+        encoding,
+        outputMode,
+        pcmFrameSize,
+        sampleRate,
+        hinted,
+        maxAudioTrackPlaybackSpeed
       )
     )
     log?.invoke(

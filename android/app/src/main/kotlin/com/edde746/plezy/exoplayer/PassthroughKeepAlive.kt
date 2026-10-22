@@ -412,6 +412,7 @@ internal class KeepAliveAudioOutput(
    */
   private var clockBaseUs = 0L
   private var realFramesAtRestart = 0L
+
   /** Real bytes written before the last restart; what came after is what the track can hold. */
   private var realBytesAtRestart = 0L
 
@@ -857,8 +858,11 @@ internal class KeepAliveAudioOutput(
 
   /** Bytes written since the last restart, complete units only: all the track can hold of ours. */
   private fun bytesQueuedSinceRestart(): Long {
-    val silenceBytes = if (silence.isPcm) silenceFramesWritten.get() * silence.pcmFrameSize
-    else silenceFramesWritten.get() / silence.framesPerUnit * silence.unit.size
+    val silenceBytes = if (silence.isPcm) {
+      silenceFramesWritten.get() * silence.pcmFrameSize
+    } else {
+      silenceFramesWritten.get() / silence.framesPerUnit * silence.unit.size
+    }
     return silenceBytes + (realBytesWritten - realBytesAtRestart)
   }
 
@@ -866,8 +870,11 @@ internal class KeepAliveAudioOutput(
   private fun bufferFrames(): Long {
     if (bufferSizeBytes == Int.MAX_VALUE) return Long.MAX_VALUE / 4
     if (silence.isPcm) return bufferSizeBytes.toLong() / silence.pcmFrameSize
-    val bytesPerFrame = if (realBytesWritten > 0 && realFramesWritten > 0) realBytesWritten.toDouble() / realFramesWritten
-    else silence.unit.size.toDouble() / silence.framesPerUnit
+    val bytesPerFrame = if (realBytesWritten > 0 && realFramesWritten > 0) {
+      realBytesWritten.toDouble() / realFramesWritten
+    } else {
+      silence.unit.size.toDouble() / silence.framesPerUnit
+    }
     return (bufferSizeBytes / bytesPerFrame).toLong()
   }
 
@@ -1158,8 +1165,7 @@ internal class KeepAliveAudioOutput(
      * so a stopped track's head still creeps rather than freezing; less than half of real time
      * is the test.
      */
-    fun isHeadStuck(lastHeadUs: Long, headUs: Long, elapsedMs: Long): Boolean =
-      headUs - lastHeadUs < elapsedMs * 1_000L / 2
+    fun isHeadStuck(lastHeadUs: Long, headUs: Long, elapsedMs: Long): Boolean = headUs - lastHeadUs < elapsedMs * 1_000L / 2
     const val BRIDGE_TIMEOUT_MS = 30_000L
     const val HEAD_GRACE_MS = 150L
     const val MAX_EXTRA_RESTARTS = 3

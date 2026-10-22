@@ -3616,9 +3616,12 @@ class ExoPlayerCore(private val activity: Activity) :
     emitLog(
       "info",
       "audio",
-      if (hints.isEmpty()) "Passthrough bitrate hints cleared"
-      else "Passthrough bitrate hints: " + hints.joinToString { "${it.codec} ${it.channels}ch ${it.bitrateKbps}kbps" } +
-        "; size the next E-AC-3 track's buffer"
+      if (hints.isEmpty()) {
+        "Passthrough bitrate hints cleared"
+      } else {
+        "Passthrough bitrate hints: " + hints.joinToString { "${it.codec} ${it.channels}ch ${it.bitrateKbps}kbps" } +
+          "; size the next E-AC-3 track's buffer"
+      }
     )
   }
 

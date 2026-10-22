@@ -25,11 +25,9 @@ class PassthroughBufferSizingTest {
     maxOf(min, bps / 8 / 2)
   }
 
-  private fun provider(spec: String) =
-    HintedPassthroughBufferSizeProvider(media3Like, { PassthroughBufferSizing.parse(spec) }, { l, p, m -> logs.add("$l [$p] $m") })
+  private fun provider(spec: String) = HintedPassthroughBufferSizeProvider(media3Like, { PassthroughBufferSizing.parse(spec) }, { l, p, m -> logs.add("$l [$p] $m") })
 
-  private fun size(p: HintedPassthroughBufferSizeProvider, encoding: Int, mode: Int = DefaultAudioSink.OUTPUT_MODE_PASSTHROUGH, bitrate: Int = Format.NO_VALUE) =
-    p.getBufferSizeInBytes(4_096, encoding, mode, 1, 48_000, bitrate, 1.0)
+  private fun size(p: HintedPassthroughBufferSizeProvider, encoding: Int, mode: Int = DefaultAudioSink.OUTPUT_MODE_PASSTHROUGH, bitrate: Int = Format.NO_VALUE) = p.getBufferSizeInBytes(4_096, encoding, mode, 1, 48_000, bitrate, 1.0)
 
   @Test
   fun parsesTheWireFormatAndSkipsWhatDoesNotFit() {
