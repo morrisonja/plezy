@@ -327,7 +327,8 @@ class PlayerAndroid extends PlayerBase {
       case 'tunneled-playback':
         _tunnelingEnabled = value != 'no';
         break;
-      // Not an mpv property: ExoPlayer's pause-time silence for bitstream tracks.
+      // Not an mpv property name: pause-time silence for bitstream tracks, which the
+      // plugin maps to ExoPlayer's keepalive wrapper or mpv's audio-stream-silence.
       case 'passthrough-keepalive':
         final enabled = value != 'no';
         _passthroughKeepAliveEnabled = enabled;

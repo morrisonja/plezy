@@ -103,7 +103,7 @@ class PlaybackSettingsScreen extends StatelessWidget {
               title: t.settings.audio,
               children: [
                 if (PlatformDetector.supportsAudioPassthrough()) _audioPassthroughTile(),
-                if (exoActive && PlatformDetector.supportsAudioPassthrough()) _passthroughKeepAliveTile(),
+                if (PlatformDetector.supportsAudioPassthrough()) _passthroughKeepAliveTile(),
                 _audioChannelLimitTile(exoActive: exoActive),
                 // Only a stereo fold mixes the center away; any fold can clip.
                 if (channelLimit == AudioChannelLimit.stereo) _downmixCenterBoostTile(),
@@ -546,7 +546,7 @@ class PlaybackSettingsScreen extends StatelessWidget {
     },
   );
 
-  // ExoPlayer-only prototype: the mpv backend's audio output has no silence path yet.
+  // Both Android backends: ExoPlayer's keepalive wrapper, mpv's audio-stream-silence.
   Widget _passthroughKeepAliveTile() => SettingsBuilder(
     prefs: const [SettingsService.audioPassthrough],
     builder: (context) {

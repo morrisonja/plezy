@@ -1829,11 +1829,20 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
       initPhase = 'configuring player';
       await currentPlayer.configureSubtitleFonts();
       await currentPlayer.setProperty('sub-ass', 'yes'); // Enable libass
+      if (Platform.isAndroid) {
+        // Keep Bitstream Alive While Paused. ExoPlayer: its keepalive wrapper. mpv: the
+        // player's own audio-stream-silence, which the audiotrack output honours for a
+        // bitstream track (mpv-build's series); an option read when the output opens, so
+        // it goes in before the first file.
+        final passthroughKeepAlive = settingsService.read(SettingsService.passthroughKeepAlive);
+        await currentPlayer.setProperty(
+          useExoPlayer ? 'passthrough-keepalive' : 'audio-stream-silence',
+          passthroughKeepAlive ? 'yes' : 'no',
+        );
+      }
       if (Platform.isAndroid && useExoPlayer) {
         final tunneledPlayback = settingsService.read(SettingsService.tunneledPlayback);
         await currentPlayer.setProperty('tunneled-playback', tunneledPlayback ? 'yes' : 'no');
-        final passthroughKeepAlive = settingsService.read(SettingsService.passthroughKeepAlive);
-        await currentPlayer.setProperty('passthrough-keepalive', passthroughKeepAlive ? 'yes' : 'no');
         await currentPlayer.setProperty('exo-buffer-tier', playbackBufferTier.nativeValue);
       }
       if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
