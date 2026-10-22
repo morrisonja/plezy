@@ -426,6 +426,61 @@ class PassthroughKeepAliveTest {
     output.flush()
   }
 
+  /**
+   * Android plays nothing from a flushed track until its buffer is full, and the 200ms the bridge
+   * keeps ahead never fills an 80000B AC-3 buffer: the receiver had no stream until media3 had
+   * loaded a whole buffer of the new position. The bridge now fills the track first.
+   */
+  @Test
+  fun aBridgeFillsTheFlushedTrackSoThatItStarts() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 10)
+    seekDuringAHold(delegate, output)
+    assertTrue(logs.toString(), logs.any { it.contains("Filling the track with silence: a bridge begins on a flushed track") })
+
+    nowMs += 150
+    repeat(10) { assertTrue("silence goes in past the 200ms target", output.feedOnce()) }
+    delegate.acceptBytes = 1000
+    assertTrue(output.feedOnce()) // the track reports full
+    assertTrue(logs.toString(), logs.any { it.contains("The track is full again after 10 units of silence") })
+    delegate.acceptBytes = Int.MAX_VALUE
+    assertTrue(output.feedOnce()) // the partial unit completes
+    delegate.playedFrames = 1536L * 2
+    assertFalse("then the target applies again", output.feedOnce())
+
+    output.play()
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertFalse(output.isBridging)
+    assertFalse(output.isHolding)
+    assertEquals("the silence ahead of the new position is not counted as played", 0L, output.getPositionUs())
+    delegate.playedFrames = 1536L * 12
+    assertEquals(32_000L, output.getPositionUs())
+  }
+
+  /**
+   * AudioTrack.flush() returns before the audio thread has discarded anything, so a write in the
+   * next milliseconds can find the track still full of the old audio. That partial write is not
+   * the fill's "full" signal (it ended fills after 0 units on the Shield, leaving the track short
+   * of the buffer and never started); the fill goes on until the bytes written could fill it.
+   */
+  @Test
+  fun aPartialWriteRightAfterTheFlushDoesNotEndTheFill() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence(), bufferSizeBytes = 2560 * 10)
+    seekDuringAHold(delegate, output)
+
+    delegate.acceptBytes = 100 // the old contents are still there
+    assertTrue(output.feedOnce())
+    assertFalse(logs.toString(), logs.any { it.contains("The track is full again") })
+    delegate.acceptBytes = Int.MAX_VALUE
+    nowMs += 150
+    assertTrue("the partial unit completes", output.feedOnce())
+    repeat(9) { assertTrue("and the fill goes on", output.feedOnce()) }
+    delegate.acceptBytes = 1000
+    assertTrue(output.feedOnce())
+    assertTrue(logs.toString(), logs.any { it.contains("The track is full again after 10 units of silence") })
+  }
+
   @Test
   fun aFlushDuringAHoldStartsABridge() {
     val delegate = FakeOutput(sampleRate = 48_000)
@@ -549,21 +604,88 @@ class PassthroughKeepAliveTest {
     seekDuringAHold(delegate, output)
     val units = settleBridge(output)
 
+    delegate.events.clear()
     assertTrue("the first unit goes in", output.write(ac3AccessUnit(), 1, 0L))
 
     assertFalse(output.isBridging)
     assertTrue(output.isHolding)
+    // A flushed track plays nothing until its buffer is full, which the bridge silence and one
+    // real unit never reach: the hold flushes it again and fills it with silence.
+    assertEquals(listOf("pause", "flush", "play"), delegate.events)
+    assertEquals(0L, output.silenceFrames)
+    assertTrue(logs.any { it.contains("Filling the track with silence: a hold begins on a flushed track") })
     assertFalse("the next one is refused until the sink plays", output.write(ac3AccessUnit(), 1, 0L))
     assertEquals(0L, output.getPositionUs())
-    delegate.playedFrames = 1536L * (units + 1) // the bridge silence and the real unit have played
+    nowMs += 150
+    repeat(10) { assertTrue("silence goes in past the target while filling", output.feedOnce()) }
+    delegate.acceptBytes = 1000
+    assertTrue(output.feedOnce()) // the track reports full
+    assertTrue(logs.toString(), logs.any { it.contains("The track is full again after 10 units of silence") })
+    delegate.acceptBytes = Int.MAX_VALUE
+    assertTrue(output.feedOnce()) // the partial unit completes
+    assertFalse("and the target applies again", output.feedOnce())
     assertEquals("frozen until play", 0L, output.getPositionUs())
-    assertFalse("the track never paused", delegate.paused)
-    assertEquals("the queue is short again, so the hold feeds silence", true, output.feedOnce())
+    assertFalse("the track never paused for real", delegate.paused)
 
     output.play()
     assertFalse(output.isHolding)
+    delegate.playedFrames = 1536L * 11 // all the fill silence has played
+    assertEquals("the discarded unit counts as played", 32_000L, output.getPositionUs())
     assertTrue(output.write(ac3AccessUnit(), 1, 0L))
-    assertEquals("play never reached the still-playing track", 2, delegate.playCalls) // one from play(), one from the bridge
+    delegate.playedFrames = 1536L * 12
+    assertEquals(64_000L, output.getPositionUs())
+    assertEquals("play never reached the still-playing track", 3, delegate.playCalls) // play(), the bridge, the hold's flush
+  }
+
+  /**
+   * The hold on a flushed track restarts it, which leaves the head unread for the grace. A resume
+   * inside that grace ends the hold, and with it the feeder that would have read the head. The
+   * next real write must do it instead, or the clock sits frozen for the life of the track while
+   * the audio plays on: that froze the picture for eight seconds on the Shield until the black
+   * screen watchdog reloaded the title.
+   */
+  @Test
+  fun aHoldOnAFlushedTrackResumedInsideTheGraceStillGetsItsHeadVerified() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    settleBridge(output)
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertTrue(output.isHolding)
+
+    nowMs += 35
+    output.play()
+    assertFalse(output.isHolding)
+    delegate.events.clear()
+    repeat(7) { assertTrue("real audio goes in while the head waits", output.write(ac3AccessUnit(), 1, 0L)) }
+    delegate.playedFrames = 1536L * 3
+    assertEquals("frozen inside the grace, the discarded unit counted", 32_000L, output.getPositionUs())
+
+    nowMs += 150
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertTrue(logs.toString(), logs.any { it.contains("Playback head verified") })
+    delegate.playedFrames = 1536L * 4
+    assertEquals("the clock runs again", 32_000L + 128_000L, output.getPositionUs())
+    assertEquals("without touching the track", emptyList<String>(), delegate.events)
+  }
+
+  /** The same resume with a head that is still stale: real audio is playing, so it is accepted rather than flushed away. */
+  @Test
+  fun aStaleHeadAfterSuchAResumeIsAcceptedRatherThanFlushed() {
+    val delegate = FakeOutput(sampleRate = 48_000)
+    val output = wrap(delegate, ac3Silence())
+    seekDuringAHold(delegate, output)
+    settleBridge(output)
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    output.play()
+    delegate.events.clear()
+    delegate.positionFn = { delegate.writes.sumOf { it.size } / 2560L * 1536L * 1_000_000L / 48_000 }
+    repeat(7) { assertTrue(output.write(ac3AccessUnit(), 1, 0L)) }
+    nowMs += 150
+    assertTrue(output.write(ac3AccessUnit(), 1, 0L))
+    assertTrue(logs.toString(), logs.any { it.contains("Playback head read stale") && it.contains("taken as is") })
+    assertEquals("no flush with real audio queued", emptyList<String>(), delegate.events)
+    assertTrue("the clock is no longer frozen", output.getPositionUs() > 32_000L)
   }
 
   /**
@@ -635,6 +757,7 @@ class PassthroughKeepAliveTest {
     assertEquals(3, delegate.events.count { it == "flush" })
     nowMs += 150
 
+    output.play() // the sink is playing, so the first real write ends the bridge without a hold
     assertTrue("real audio flows again, out of sync rather than never", output.write(ac3AccessUnit(), 1, 0L))
     assertTrue(logs.any { it.contains("giving up after 3 extra restarts") })
     assertEquals("no fourth flush", 3, delegate.events.count { it == "flush" })
