@@ -412,6 +412,8 @@ internal class KeepAliveAudioOutput(
    */
   private var clockBaseUs = 0L
   private var realFramesAtRestart = 0L
+  /** Real bytes written before the last restart; what came after is what the track can hold. */
+  private var realBytesAtRestart = 0L
 
   /** Pinned-clock watch: since when the delegate's position has sat on the frames written. */
   private var pinnedSinceMs = Long.MIN_VALUE
@@ -443,6 +445,12 @@ internal class KeepAliveAudioOutput(
       // the one writing to it); without a feeder (tests) this write may.
       if (!maybeVerifyHead(allowRestart = feeder == null)) return false
       stopFeeder("first real write")
+    } else if (!headVerified) {
+      // A hold that began on a flushed track restarted it, and a resume inside the grace ended
+      // the hold before its feeder could read the head. Nothing else would: the clock would sit
+      // frozen for the life of the track (the video is rendered against it) while the audio
+      // played on. Real audio is queued by now, so a stale head is not worth another flush.
+      maybeVerifyHead(allowRestart = false, acceptStale = true)
     }
     if (!silence.isPcm && framesPerAccessUnit == 0 && buffer.hasRemaining()) {
       framesPerAccessUnit = silence.framesPerAccessUnit(buffer)
@@ -472,7 +480,7 @@ internal class KeepAliveAudioOutput(
       // pause does, until play() arrives; the one unit just written is what keeps the renderer
       // ready (frames written > position) in the meantime.
       synchronized(lock) {
-        if (!sinkPlaying && delegatePlaying && !holding) engageHold("the sink is still paused after the seek")
+        if (!sinkPlaying && delegatePlaying && !holding) engageHold("the sink is still paused after the seek", onFlushedTrack = true)
       }
     }
     return handled
@@ -482,7 +490,10 @@ internal class KeepAliveAudioOutput(
     if (!headVerified) {
       // The head is unreadable right after a restart (class doc), and nothing real has played
       // since: the clock sits where the restart left it.
-      val frozen = if (lastReportedUs > clockBaseUs) lastReportedUs else clockBaseUs
+      var frozen = if (lastReportedUs > clockBaseUs) lastReportedUs else clockBaseUs
+      // A hold that flushed the track moved the clock base past the unit it discarded; the clock
+      // still waits for the resume like any hold's.
+      if (holding && positionAtPauseUs != Long.MIN_VALUE && frozen > positionAtPauseUs) frozen = positionAtPauseUs
       lastReportedUs = frozen
       return frozen
     }
@@ -664,7 +675,10 @@ internal class KeepAliveAudioOutput(
   /**
    * Bridges a seek: discards what the track still holds (the old position's tail and any hold
    * silence), restarts it within milliseconds so the output never goes idle, and feeds silence
-   * until the first real write of the new position. media3 resets its written frames and its
+   * until the first real write of the new position. Android plays nothing from a flushed track
+   * until its buffer is full, so the feeder first fills it (a seek on an AC-3 track otherwise
+   * left the receiver without a stream until media3 had loaded a whole buffer of the new
+   * position, seconds on a slow seek); the new position is heard once that silence has played. media3 resets its written frames and its
    * position tracker on this flush, and the accounting here restarts with them. With [keepClock]
    * (a restart the wrapper decided on itself, mid-playback) the discarded real audio counts as
    * played and the clock continues from where it was.
@@ -695,6 +709,10 @@ internal class KeepAliveAudioOutput(
         "Bridging: ${silence.label} across the $reason${if (wasHolding) " that ended a hold" else ""}; " +
           "the track was flushed and restarted in ${restartedMs}ms, silence starts at once and the head is left unread for ${headGraceMs}ms"
       )
+      fillRequested = false
+      if (bufferSizeBytes != Int.MAX_VALUE) {
+        requestFill("a bridge begins on a flushed track, which Android will not start until its buffer is full")
+      }
       startFeeder()
     }
   }
@@ -712,6 +730,7 @@ internal class KeepAliveAudioOutput(
     restartedAtMs = clock()
     headUnreadableUntilMs = restartedAtMs + headGraceMs
     headVerified = false
+    realBytesAtRestart = realBytesWritten
     silenceFramesWritten.set(0)
     pendingUnit = null
     pinnedSinceMs = Long.MIN_VALUE
@@ -724,9 +743,11 @@ internal class KeepAliveAudioOutput(
    * restart, so a counter that was reset is well behind the frames written; a stale one makes
    * media3 clamp the position to exactly those frames. Stale means another flush and restart
    * (with [allowRestart]; otherwise the caller waits for the feeder to do it), up to
-   * [MAX_EXTRA_RESTARTS] times. Returns whether the head is usable.
+   * [MAX_EXTRA_RESTARTS] times. With [acceptStale] (real audio is already playing, so a flush
+   * would cost it) a stale head is taken as is and left to the pinned-clock watch. Returns
+   * whether the head is usable.
    */
-  private fun maybeVerifyHead(allowRestart: Boolean): Boolean {
+  private fun maybeVerifyHead(allowRestart: Boolean, acceptStale: Boolean = false): Boolean {
     if (headVerified) return true
     if (clock() < headUnreadableUntilMs) return false
     synchronized(lock) {
@@ -748,6 +769,16 @@ internal class KeepAliveAudioOutput(
           "keepalive",
           "Playback head verified ${sinceRestartMs}ms after the restart: ${headUs / 1000}ms played of the ${writtenUs / 1000}ms written since" +
             if (restartAttempts > 0) " (after $restartAttempts extra restart${if (restartAttempts > 1) "s" else ""})" else ""
+        )
+        return true
+      }
+      if (acceptStale) {
+        headVerified = true
+        log?.invoke(
+          "warn",
+          "keepalive",
+          "Playback head read stale ${sinceRestartMs}ms after the restart with real audio already playing: it reports the " +
+            "${writtenUs / 1000}ms written; taken as is, the pinned-clock watch restarts the track if the clock sticks"
         )
         return true
       }
@@ -777,13 +808,29 @@ internal class KeepAliveAudioOutput(
   }
 
   /** Starts a hold. The lock must be held. */
-  private fun engageHold(note: String?) {
+  /**
+   * Starts a hold. The lock must be held. With [onFlushedTrack] the hold begins on a track that
+   * was flushed for a bridge and has not started: Android plays nothing from it until its buffer
+   * is full, and the bridge silence plus the one real unit are far short of that, so a pause
+   * right after a seek would leave the receiver with no stream for as long as it lasted. The
+   * track is flushed once more, discarding that unit (its frames count as played so the clock
+   * stays true), and the feeder fills it with silence so that it starts.
+   */
+  private fun engageHold(note: String?, onFlushedTrack: Boolean = false) {
     positionAtPauseUs = getPositionUs()
     holding = true
     stopRequested = false
     feedStartedMs = clock()
     unitsWritten = 0
     fillRequested = false
+    if (onFlushedTrack) {
+      val discarded = realFramesWritten - realFramesAtRestart
+      restartTrack()
+      realFramesAtRestart = realFramesWritten
+      clockBaseUs += framesToUs(discarded)
+      lastPartial = null
+      requestFill("a hold begins on a flushed track, which Android will not start until its buffer is full")
+    }
     val cutTail = lastPartial
     if (cutTail != null && pendingUnit == null) {
       pendingUnit = ByteBuffer.wrap(cutTail)
@@ -806,6 +853,13 @@ internal class KeepAliveAudioOutput(
         if (note != null) " ($note)" else ""
     )
     startFeeder()
+  }
+
+  /** Bytes written since the last restart, complete units only: all the track can hold of ours. */
+  private fun bytesQueuedSinceRestart(): Long {
+    val silenceBytes = if (silence.isPcm) silenceFramesWritten.get() * silence.pcmFrameSize
+    else silenceFramesWritten.get() / silence.framesPerUnit * silence.unit.size
+    return silenceBytes + (realBytesWritten - realBytesAtRestart)
   }
 
   /** The frames the track's buffer holds, at the real stream's bytes per frame. */
@@ -853,6 +907,7 @@ internal class KeepAliveAudioOutput(
     clockBaseUs = 0L
     realFramesAtRestart = 0L
     realBytesWritten = 0L
+    realBytesAtRestart = 0L
     lagFrames = 0L
     fillRequested = false
     pendingUnitIsReal = false
@@ -930,15 +985,15 @@ internal class KeepAliveAudioOutput(
           headCheckedAtMs = now
         } else if (now - headCheckedAtMs >= HEAD_STALL_CHECK_MS) {
           val headUs = delegate.getPositionUs()
-          if (lastHeadUs != Long.MIN_VALUE && unitsWritten > 0 && isHeadStuck(lastHeadUs, headUs, now - headCheckedAtMs)) {
+          if (lastHeadUs != Long.MIN_VALUE && queuedFrames() > 0 && isHeadStuck(lastHeadUs, headUs, now - headCheckedAtMs)) {
             // A direct track that underran was disabled, and after a flush it has not started:
             // either way Android plays nothing until the buffer is full, so fill it. A platform
             // that discards the frames (a DTS frame too large for its IEC burst did) never
             // reports the track full; the fill then gives up after two buffers' worth.
             if (holding && !fillRequested) {
               requestFill(
-                "the head has sat at ${headUs / 1000}ms for ${now - headCheckedAtMs}ms while $unitsWritten silence units " +
-                  "were accepted (${silence.label}), so the track is not playing"
+                "the head has sat at ${headUs / 1000}ms for ${now - headCheckedAtMs}ms with ~${framesToUs(queuedFrames()) / 1000}ms queued " +
+                  "(${silence.label}), so the track is not playing"
               )
             } else if (!stallLogged) {
               stallLogged = true
@@ -991,8 +1046,8 @@ internal class KeepAliveAudioOutput(
           return false
         }
       } else {
-        // While bridging nothing plays until the real audio fills the track, so the head has
-        // no lag to speak of; during a hold it does.
+        // A bridge starts by filling the track (above); once it plays, the head has no lag to
+        // speak of. During a hold it does.
         val lag = if (holding) lagFrames else 0L
         if (queuedFrames() - lag >= targetAheadFrames) return false
       }
@@ -1033,18 +1088,26 @@ internal class KeepAliveAudioOutput(
       return true
     }
     pendingUnit = unit
+    val wroteBytes = before - unit.remaining()
     // A partial write means the track is full, which is the one moment its contents are known:
-    // the head's lag is whatever the queue shows beyond the buffer.
+    // the head's lag is whatever the queue shows beyond the buffer. Unless it cannot be: right
+    // after a restart the audio thread may not have got to the flush yet, and the track still
+    // looks full of what the flush is about to discard. The fill then goes on (a fill that ended
+    // there left an AC-3 track at 11 units of its 31, never to start, and the receiver without a
+    // stream until media3 had loaded the rest).
+    if (bufferSizeBytes != Int.MAX_VALUE && bytesQueuedSinceRestart() + wroteBytes + silence.unit.size <= bufferSizeBytes) {
+      return wroteBytes != 0
+    }
     if (holding) {
       val queued = queuedFrames()
       val held = bufferFrames()
       lagFrames = if (queued > held) queued - held else 0L
-      if (fillRequested) {
-        fillRequested = false
-        log?.invoke("info", "keepalive", "The track is full again after ${unitsWritten - fillStartedUnits} units of silence")
-      }
     }
-    return unit.remaining() != before
+    if (fillRequested) {
+      fillRequested = false
+      log?.invoke("info", "keepalive", "The track is full again after ${unitsWritten - fillStartedUnits} units of silence")
+    }
+    return wroteBytes != 0
   }
 
   /**
