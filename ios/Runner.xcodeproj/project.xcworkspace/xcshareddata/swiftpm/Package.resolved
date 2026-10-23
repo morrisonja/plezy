@@ -30,9 +30,9 @@
     {
       "identity" : "mpv-build",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/edde746/mpv-build",
+      "location" : "https://github.com/morrisonja/mpv-build",
       "state" : {
-        "revision" : "582f6d6e748a87a1536bf5cdad0af97b75725ffb"
+        "revision" : "f23a65b8f4415d8b6ee1e0922ddb87d6342833d8"
       }
     },
     {
